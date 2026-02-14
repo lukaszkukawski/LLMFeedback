@@ -1,0 +1,77 @@
+:root {
+  color-scheme: light;
+}
+
+body {
+  margin: 0;
+  font-family: "Segoe UI", Tahoma, sans-serif;
+  background: linear-gradient(160deg, #f8fbff, #eef4ff);
+  width: 360px;
+}
+
+main {
+  padding: 12px;
+}
+
+h1 {
+  margin: 0 0 10px;
+  font-size: 16px;
+}
+
+.status {
+  margin: 0 0 12px;
+  font-size: 12px;
+}
+
+.row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.block {
+  margin-bottom: 8px;
+}
+
+.full {
+  width: 100%;
+}
+
+label {
+  display: block;
+  font-size: 12px;
+  margin-bottom: 4px;
+}
+
+textarea {
+  width: 100%;
+  box-sizing: border-box;
+  resize: vertical;
+  font-size: 12px;
+  margin-bottom: 6px;
+}
+
+button {
+  border: 1px solid #8ea6d6;
+  background: #ffffff;
+  border-radius: 6px;
+  padding: 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+button:hover {
+  background: #f0f6ff;
+}
+
+.meta {
+  border-top: 1px solid #d7e1f5;
+  padding-top: 8px;
+  font-size: 11px;
+}
+
+.message {
+  min-height: 18px;
+  color: #1d3e74;
+}

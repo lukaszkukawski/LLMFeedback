@@ -1,0 +1,14 @@
+{
+  "outputDir": "./reports",
+  "writeMarkdown": true,
+  "maxOuterHtmlChars": 200000,
+  "maxTextChars": 20000,
+  "maxAttachmentChars": 5000000,
+  "maskPasswordInputs": true,
+  "sensitivePatterns": [
+    "(?:Bearer\\s+)?[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{8,}\\.[A-Za-z0-9_-]{8,}",
+    "Bearer\\s+[A-Za-z0-9._~-]{16,}",
+    "(api[_-]?key\\s*[=:]\\s*)([A-Za-z0-9._-]{12,})",
+    "(token\\s*[=:]\\s*)([A-Za-z0-9._-]{12,})"
+  ]
+}
