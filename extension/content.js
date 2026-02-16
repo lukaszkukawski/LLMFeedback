@@ -18,6 +18,7 @@
   let floatingScrollKnob = null;
   let floatingErrorButton = null;
   let floatingErrorLabel = null;
+  let floatingErrorPulse = null;
   let floatingFilePath = null;
   let floatingMarkAreaBtn = null;
   let floatingPickElementBtn = null;
@@ -36,8 +37,9 @@
   let prevBodyOverscroll = "";
   let prevHtmlUserSelect = "";
   let prevBodyUserSelect = "";
+  let overlaysHiddenForScreenshot = false;
   const regionVisuals = new Map();
-  const DEBUG_LOGS = true;
+  const DEBUG_LOGS = false;
 
   function debugLog(...args) {
     if (!DEBUG_LOGS) {
@@ -70,6 +72,103 @@
     }
   }
 
+  function isExtensionContextInvalidatedError(errorLike) {
+    const message =
+      typeof errorLike === "string" ? errorLike : String(errorLike?.message || "");
+    return /extension context invalidated/i.test(message);
+  }
+
+  function handleExtensionContextInvalidated() {
+    sessionActive = false;
+    errorRecordingEnabled = false;
+    regionMode = false;
+    elementMode = false;
+    drawing = false;
+    drawStart = null;
+    hideDrawPreview();
+    if (interactionLayer) {
+      interactionLayer.style.display = "none";
+    }
+    setCursor(false);
+    setScrollLockReason("region", false);
+    setScrollLockReason("element", false);
+    updateModeButtons();
+    updateErrorRecordingButton();
+    if (floatingStatus) {
+      floatingStatus.textContent =
+        "Rozszerzenie zostało przeładowane. Odśwież stronę (Cmd/Ctrl+R), aby kontynuować.";
+      floatingStatus.style.color = "#b42318";
+    }
+  }
+
+  function safeSendMessage(message, callback) {
+    try {
+      chrome.runtime.sendMessage(message, (response) => {
+        const runtimeError = chrome.runtime.lastError;
+        if (runtimeError && isExtensionContextInvalidatedError(runtimeError)) {
+          handleExtensionContextInvalidated();
+        }
+        if (typeof callback === "function") {
+          callback(response);
+        }
+      });
+      return true;
+    } catch (error) {
+      if (isExtensionContextInvalidatedError(error)) {
+        handleExtensionContextInvalidated();
+        if (typeof callback === "function") {
+          callback({
+            ok: false,
+            error:
+              "Rozszerzenie zostało przeładowane. Odśwież stronę (Cmd/Ctrl+R) i spróbuj ponownie."
+          });
+        }
+        return false;
+      }
+      throw error;
+    }
+  }
+
+  function setUiOverlayVisibility(visible) {
+    const nodes = document.querySelectorAll("[data-ui-feedback-control='1']");
+    for (const node of nodes) {
+      if (!(node instanceof HTMLElement)) {
+        continue;
+      }
+
+      if (!visible) {
+        if (node.dataset.uiFeedbackPrevVisibility === undefined) {
+          node.dataset.uiFeedbackPrevVisibility = node.style.visibility || "";
+        }
+        node.style.visibility = "hidden";
+        continue;
+      }
+
+      if (node.dataset.uiFeedbackPrevVisibility !== undefined) {
+        node.style.visibility = node.dataset.uiFeedbackPrevVisibility;
+        delete node.dataset.uiFeedbackPrevVisibility;
+      } else {
+        node.style.visibility = "";
+      }
+    }
+  }
+
+  function hideUiOverlaysForScreenshot() {
+    if (overlaysHiddenForScreenshot) {
+      return;
+    }
+    overlaysHiddenForScreenshot = true;
+    setUiOverlayVisibility(false);
+  }
+
+  function showUiOverlaysAfterScreenshot() {
+    if (!overlaysHiddenForScreenshot) {
+      return;
+    }
+    overlaysHiddenForScreenshot = false;
+    setUiOverlayVisibility(true);
+  }
+
   function setScrollLockReason(reason, enabled) {
     if (enabled) {
       scrollLockReasons.add(reason);
@@ -95,7 +194,12 @@
       return;
     }
     if (floatingErrorLabel) {
-      floatingErrorLabel.textContent = "Rejestruj zdarzenia i logi konsoli";
+      floatingErrorLabel.textContent = errorRecordingEnabled
+        ? "Nagrywanie zdarzeń i logów"
+        : "Rejestruj zdarzenia i logi konsoli";
+    }
+    if (floatingErrorPulse) {
+      floatingErrorPulse.style.display = errorRecordingEnabled ? "inline-flex" : "none";
     }
     floatingErrorButton.style.background = errorRecordingEnabled ? "rgba(239, 68, 68, 0.22)" : "rgba(239, 68, 68, 0.08)";
     floatingErrorButton.style.color = errorRecordingEnabled ? "#fca5a5" : "#f87171";
@@ -250,10 +354,28 @@
     floatingPanel.style.bottom = `${margin + launcherSize + gap}px`;
   }
 
+  function ensureUiFeedbackStyles() {
+    if (document.getElementById("ui-feedback-recorder-styles")) {
+      return;
+    }
+    const style = document.createElement("style");
+    style.id = "ui-feedback-recorder-styles";
+    style.textContent = `
+      @keyframes uiFeedbackRecPulse {
+        0% { transform: scale(0.75); opacity: 0.9; }
+        70% { transform: scale(1.75); opacity: 0; }
+        100% { transform: scale(1.75); opacity: 0; }
+      }
+    `;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
   function ensureFloatingControls() {
     if (floatingLauncher && floatingPanel) {
       return;
     }
+
+    ensureUiFeedbackStyles();
 
     floatingLauncher = document.createElement("button");
     floatingLauncher.type = "button";
@@ -608,6 +730,26 @@
       '<path d="M4 12H8L10.2 7L13.5 16L16 11H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
       14
     );
+    errorIcon.style.position = "relative";
+    errorIcon.style.display = "inline-flex";
+    errorIcon.style.alignItems = "center";
+    errorIcon.style.justifyContent = "center";
+    errorIcon.style.width = "18px";
+    errorIcon.style.height = "18px";
+
+    floatingErrorPulse = document.createElement("span");
+    floatingErrorPulse.dataset.uiFeedbackControl = "1";
+    floatingErrorPulse.style.position = "absolute";
+    floatingErrorPulse.style.width = "8px";
+    floatingErrorPulse.style.height = "8px";
+    floatingErrorPulse.style.right = "-1px";
+    floatingErrorPulse.style.top = "-1px";
+    floatingErrorPulse.style.borderRadius = "9999px";
+    floatingErrorPulse.style.background = "#ef4444";
+    floatingErrorPulse.style.boxShadow = "0 0 0 0 rgba(239, 68, 68, 0.55)";
+    floatingErrorPulse.style.animation = "uiFeedbackRecPulse 1.15s ease-out infinite";
+    floatingErrorPulse.style.display = "none";
+
     floatingErrorLabel = document.createElement("span");
     floatingErrorLabel.dataset.uiFeedbackControl = "1";
     floatingErrorLabel.textContent = "Rejestruj zdarzenia i logi konsoli";
@@ -615,6 +757,7 @@
     floatingErrorLabel.style.lineHeight = "1.15";
     floatingErrorLabel.style.pointerEvents = "none";
     floatingErrorLabel.style.whiteSpace = "normal";
+    errorIcon.appendChild(floatingErrorPulse);
     floatingErrorButton.appendChild(errorIcon);
     floatingErrorButton.appendChild(floatingErrorLabel);
 
@@ -828,7 +971,7 @@
 
     const versionText = document.createElement("span");
     versionText.dataset.uiFeedbackControl = "1";
-    versionText.textContent = "v1.0.0";
+    versionText.textContent = "v1.0.1";
     versionText.style.fontSize = "8px";
     versionText.style.color = "#64748b";
 
@@ -956,7 +1099,7 @@
         setFloatingStatus("Tworzenie sesji...", false);
       }
 
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         { type: "INIT_SESSION_FROM_CONTENT", reset: false },
         (response) => {
           if (chrome.runtime.lastError || !response?.ok) {
@@ -987,7 +1130,7 @@
         setFloatingStatus("Tworzenie sesji...", false);
       }
 
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         { type: "INIT_SESSION_FROM_CONTENT", reset: false },
         (response) => {
           if (chrome.runtime.lastError || !response?.ok) {
@@ -1010,6 +1153,38 @@
       );
     };
 
+    const resetSessionFromPanel = ({
+      successMessage,
+      errorMessage,
+      onFailureMessage = ""
+    }) => {
+      safeSendMessage(
+        { type: "INIT_SESSION_FROM_CONTENT", reset: true },
+        (response) => {
+          if (chrome.runtime.lastError || !response?.ok) {
+            const fallback = errorMessage || "Błąd czyszczenia sesji.";
+            if (onFailureMessage) {
+              setFloatingStatus(onFailureMessage, true);
+            } else {
+              setFloatingStatus(
+                response?.error || chrome.runtime.lastError?.message || fallback,
+                true
+              );
+            }
+            return;
+          }
+
+          sessionActive = true;
+          stopRegionMode();
+          stopElementMode();
+          errorRecordingEnabled = false;
+          updateErrorRecordingButton();
+          clearAllRegionVisuals();
+          setFloatingStatus(successMessage || "Wyczyszczono sesję.");
+        }
+      );
+    };
+
     markAreaBtn.addEventListener(
       "click",
       (event) => {
@@ -1025,25 +1200,10 @@
       (event) => {
         event.preventDefault();
         event.stopPropagation();
-        chrome.runtime.sendMessage(
-          { type: "INIT_SESSION_FROM_CONTENT", reset: true },
-          (response) => {
-            if (chrome.runtime.lastError || !response?.ok) {
-              setFloatingStatus(
-                response?.error || chrome.runtime.lastError?.message || "Błąd czyszczenia.",
-                true
-              );
-              return;
-            }
-            sessionActive = true;
-            stopRegionMode();
-            stopElementMode();
-            errorRecordingEnabled = false;
-            updateErrorRecordingButton();
-            clearAllRegionVisuals();
-            setFloatingStatus("Wyczyszczono sesję.");
-          }
-        );
+        resetSessionFromPanel({
+          successMessage: "Wyczyszczono sesję.",
+          errorMessage: "Błąd czyszczenia."
+        });
       },
       true
     );
@@ -1091,7 +1251,7 @@
           setFloatingStatus("Tworzenie sesji...", false);
         }
 
-        chrome.runtime.sendMessage(
+        safeSendMessage(
           { type: "INIT_SESSION_FROM_CONTENT", reset: false },
           (response) => {
             if (chrome.runtime.lastError || !response?.ok) {
@@ -1113,7 +1273,7 @@
 
     const exportToBackend = (fileName) => {
       setFloatingStatus("Zapisywanie pliku...", false);
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         {
           type: "EXPORT_TO_BACKEND",
           fileName
@@ -1134,14 +1294,20 @@
 
           const requestedStem = sanitizeFileStem(fileName);
           if (!isRequestedStemUsed(requestedStem, jsonPath, mdPath)) {
-            setFloatingStatus(
-              "Zapisano raport, ale backend nie użył podanej nazwy. Zrestartuj backend i spróbuj ponownie.",
-              true
-            );
+            resetSessionFromPanel({
+              successMessage:
+                "Zapisano raport, ale backend nie użył podanej nazwy. Rozpoczęto nową czystą sesję.",
+              onFailureMessage:
+                "Zapisano raport, ale backend nie użył podanej nazwy i nie udało się automatycznie wyczyścić sesji.",
+            });
             return;
           }
 
-          setFloatingStatus(`Zapisano raport: ${result.reportId || "ok"}`, false);
+          resetSessionFromPanel({
+            successMessage: `Zapisano raport: ${result.reportId || "ok"}. Rozpoczęto nową czystą sesję.`,
+            onFailureMessage:
+              "Zapisano raport, ale nie udało się automatycznie wyczyścić sesji.",
+          });
         }
       );
     };
@@ -1154,7 +1320,7 @@
       }
 
       const submit = () => {
-        chrome.runtime.sendMessage(
+        safeSendMessage(
           {
             type: "ADD_GENERAL_INFO",
             comment,
@@ -1183,7 +1349,7 @@
       }
 
       setFloatingStatus("Tworzenie sesji...", false);
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         { type: "INIT_SESSION_FROM_CONTENT", reset: false },
         (response) => {
           if (chrome.runtime.lastError || !response?.ok) {
@@ -1229,6 +1395,7 @@
     generalInfoField.appendChild(generalInfoLabel);
     generalInfoField.appendChild(generalInfoInput);
     panelBody.appendChild(row);
+
     panelBody.appendChild(row2);
     panelBody.appendChild(generalInfoField);
     panelBody.appendChild(row3);
@@ -1406,10 +1573,13 @@
   ]);
 
   function shouldRecordTimelineEvent(type) {
+    if (ALWAYS_RECORDED_EVENT_TYPES.has(type)) {
+      return true;
+    }
     if (!errorRecordingEnabled) {
       return false;
     }
-    return ALWAYS_RECORDED_EVENT_TYPES.has(type) || ERROR_RECORDING_EVENT_TYPES.has(type);
+    return ERROR_RECORDING_EVENT_TYPES.has(type);
   }
 
   function sendEvent(type, data = {}, element = null) {
@@ -1420,7 +1590,7 @@
       return;
     }
 
-    chrome.runtime.sendMessage({
+    safeSendMessage({
       type: "TIMELINE_EVENT",
       event: {
         type,
@@ -1492,6 +1662,7 @@
     drawPreview.style.border = "2px solid #ff4d4f";
     drawPreview.style.background = "rgba(255, 77, 79, 0.12)";
     drawPreview.style.display = "none";
+    drawPreview.dataset.uiFeedbackControl = "1";
     document.documentElement.appendChild(drawPreview);
   }
 
@@ -1952,12 +2123,13 @@
         commentLength: comment.length
       });
 
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         {
           type: "ADD_ANNOTATION_FOR_REGION",
           regionId,
           comment,
           region: regionItem.region,
+          selectionType: regionItem.selectionType || "area",
           element: regionItem.element,
           url: regionItem.url
         },
@@ -2098,7 +2270,7 @@
     editorBox.style.top = `${Math.round(chosen.top)}px`;
 
     visual.editorBox = editorBox;
-    chrome.runtime.sendMessage(
+    safeSendMessage(
       {
         type: "GET_REGION_NOTE",
         regionId
@@ -2146,6 +2318,7 @@
     marker.style.pointerEvents = "none";
     marker.style.zIndex = "2147483646";
     marker.dataset.uiFeedbackRegionId = regionId;
+    marker.dataset.uiFeedbackControl = "1";
 
     const badge = document.createElement("span");
     const badgeKind = options.badgeKind === "element" ? "element" : "obszar";
@@ -2306,7 +2479,7 @@
       event.preventDefault();
       event.stopPropagation();
 
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         {
           type: "REMOVE_REGION",
           regionId
@@ -2352,7 +2525,7 @@
         event.stopPropagation();
         const visual = getRegionVisual(regionId);
         if (visual?.cssAttached) {
-          chrome.runtime.sendMessage(
+          safeSendMessage(
             {
               type: "DETACH_REGION_CSS",
               regionId
@@ -2405,7 +2578,7 @@
           return;
         }
 
-        chrome.runtime.sendMessage(
+        safeSendMessage(
           {
             type: "ATTACH_REGION_CSS",
             regionId,
@@ -2455,7 +2628,7 @@
         event.stopPropagation();
         const visual = getRegionVisual(regionId);
         if (visual?.htmlAttached) {
-          chrome.runtime.sendMessage(
+          safeSendMessage(
             {
               type: "DETACH_REGION_HTML",
               regionId
@@ -2506,7 +2679,7 @@
           return;
         }
 
-        chrome.runtime.sendMessage(
+        safeSendMessage(
           {
             type: "ATTACH_REGION_HTML",
             regionId,
@@ -2679,7 +2852,7 @@
     const centerEl = document.elementFromPoint(centerX, centerY);
 
     const region = buildRegion(rect);
-    chrome.runtime.sendMessage(
+    safeSendMessage(
       {
         type: "REGION_SELECTED",
         region,
@@ -2755,7 +2928,7 @@
         captureMode: "full"
       });
 
-      chrome.runtime.sendMessage(
+      safeSendMessage(
         {
           type: "ELEMENT_SELECTED",
           element,
@@ -2821,12 +2994,6 @@
     if (!(target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement || target instanceof HTMLSelectElement)) {
       return;
     }
-
-    // `input` fires per character; for timeline keep only stable value changes.
-    if (event.type !== "change") {
-      return;
-    }
-
     let value = "";
     if (target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) {
       value = target.type === "password" ? "[MASKED_PASSWORD]" : target.value;
@@ -3014,6 +3181,7 @@
     if (message.type === "SET_SESSION_ACTIVE") {
       sessionActive = !!message.enabled;
       if (!sessionActive) {
+        showUiOverlaysAfterScreenshot();
         errorRecordingEnabled = false;
         updateErrorRecordingButton();
         stopRegionMode();
@@ -3071,6 +3239,17 @@
 
     if (message.type === "PING") {
       sendResponse({ ok: true, sessionActive, regionMode, elementMode, errorRecordingEnabled });
+      return true;
+    }
+
+    if (message.type === "SET_OVERLAY_VISIBILITY") {
+      const shouldBeVisible = message.visible !== false;
+      if (shouldBeVisible) {
+        showUiOverlaysAfterScreenshot();
+      } else {
+        hideUiOverlaysForScreenshot();
+      }
+      sendResponse({ ok: true, visible: shouldBeVisible });
       return true;
     }
 

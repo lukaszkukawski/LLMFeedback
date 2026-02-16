@@ -1,5 +1,5 @@
 const STORAGE_KEY = "uiFeedbackState";
-const CORRELATION_WINDOW_MS = 10_000;
+const CORRELATION_WINDOW_MS = 30_000;
 const LOCAL_API_URL = "http://127.0.0.1:3030/analyze";
 const DEBUG_LOGS = true;
 
@@ -165,6 +165,108 @@ function normalizeRegion(region) {
   };
 }
 
+function clampInt(value, min, max) {
+  const numeric = Number(value);
+  if (!Number.isFinite(numeric)) {
+    return min;
+  }
+  return Math.max(min, Math.min(max, Math.round(numeric)));
+}
+
+function uint8ToBase64(bytes) {
+  let binary = "";
+  const chunkSize = 0x8000;
+  for (let i = 0; i < bytes.length; i += chunkSize) {
+    const chunk = bytes.subarray(i, i + chunkSize);
+    binary += String.fromCharCode.apply(null, chunk);
+  }
+  return btoa(binary);
+}
+
+async function cropScreenshotToRegion(dataUrl, region) {
+  if (typeof dataUrl !== "string" || !region || typeof OffscreenCanvas === "undefined") {
+    return dataUrl;
+  }
+
+  const viewportW = Number(region.viewportW || 0);
+  const viewportH = Number(region.viewportH || 0);
+  const viewportX = Number(region.viewportX || 0);
+  const viewportY = Number(region.viewportY || 0);
+  const width = Number(region.width || 0);
+  const height = Number(region.height || 0);
+
+  if (
+    viewportW <= 0 ||
+    viewportH <= 0 ||
+    width <= 1 ||
+    height <= 1 ||
+    typeof fetch !== "function" ||
+    typeof createImageBitmap !== "function"
+  ) {
+    return dataUrl;
+  }
+
+  let bitmap = null;
+  try {
+    const sourceBlob = await (await fetch(dataUrl)).blob();
+    bitmap = await createImageBitmap(sourceBlob);
+
+    const scaleX = bitmap.width / viewportW;
+    const scaleY = bitmap.height / viewportH;
+
+    let sx = clampInt(viewportX * scaleX, 0, Math.max(0, bitmap.width - 1));
+    let sy = clampInt(viewportY * scaleY, 0, Math.max(0, bitmap.height - 1));
+    let sw = clampInt(width * scaleX, 1, bitmap.width);
+    let sh = clampInt(height * scaleY, 1, bitmap.height);
+
+    if (sx + sw > bitmap.width) {
+      sw = Math.max(1, bitmap.width - sx);
+    }
+    if (sy + sh > bitmap.height) {
+      sh = Math.max(1, bitmap.height - sy);
+    }
+
+    if (sw <= 1 || sh <= 1) {
+      return dataUrl;
+    }
+
+    const canvas = new OffscreenCanvas(sw, sh);
+    const ctx = canvas.getContext("2d");
+    if (!ctx) {
+      return dataUrl;
+    }
+    ctx.drawImage(bitmap, sx, sy, sw, sh, 0, 0, sw, sh);
+
+    const croppedBlob = await canvas.convertToBlob({ type: "image/png" });
+    const bytes = new Uint8Array(await croppedBlob.arrayBuffer());
+    return `data:image/png;base64,${uint8ToBase64(bytes)}`;
+  } catch {
+    return dataUrl;
+  } finally {
+    if (bitmap && typeof bitmap.close === "function") {
+      bitmap.close();
+    }
+  }
+}
+
+async function setOverlayVisibilityForCapture(tabId, visible) {
+  if (typeof tabId !== "number") {
+    return;
+  }
+  try {
+    await chrome.tabs.sendMessage(tabId, {
+      type: "SET_OVERLAY_VISIBILITY",
+      visible
+    });
+  } catch (error) {
+    debugLog("SET_OVERLAY_VISIBILITY:failed", {
+      tabId,
+      visible,
+      message: error?.message || String(error)
+    });
+  }
+}
+
 function buildEvent(state, payload) {
   return {
     id: makeId("evt"),
@@ -324,6 +426,7 @@ async function addRegionSelection({ tabId, url, region, element }) {
       id: makeId("region"),
       ts: nowIso(),
       url: url || state.session.pageContext.url,
+      selectionType: "area",
       region: normalizedRegion,
       element: normalizeElement(element)
     };
@@ -608,8 +711,16 @@ async function detachRegionHtml({ tabId, regionId }) {
   });
 }
 
-async function addAnnotationForRegion({ tabId, regionId, comment, regionSnapshot, element, url }) {
-  return mutateState((state) => {
+async function addAnnotationForRegion({
+  tabId,
+  regionId,
+  comment,
+  regionSnapshot,
+  element,
+  url,
+  selectionType
+}) {
+  return mutateState(async (state) => {
     debugLog("ADD_ANNOTATION_FOR_REGION:request", {
       tabId,
       activeTabId: state.tabId,
@@ -636,6 +747,7 @@ async function addAnnotationForRegion({ tabId, regionId, comment, regionSnapshot
         id: regionId || makeId("region"),
         ts: nowIso(),
         url: url || state.session.pageContext.url,
+        selectionType: selectionType === "element" ? "element" : "area",
         region: normalizeRegion(regionSnapshot),
         element: normalizeElement(element)
       };
@@ -657,6 +769,42 @@ async function addAnnotationForRegion({ tabId, regionId, comment, regionSnapshot
       return { ok: false, error: "Nie znaleziono obszaru." };
     }
 
+    let screenshotId = null;
+    const resolvedSelectionType =
+      region.selectionType === "element" || selectionType === "element" ? "element" : "area";
+    if (resolvedSelectionType === "area" && typeof state.windowId === "number") {
+      let overlayHidden = false;
+      try {
+        await setOverlayVisibilityForCapture(state.tabId, false);
+        overlayHidden = true;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+
+        const screenshotDataUrl = await chrome.tabs.captureVisibleTab(state.windowId, {
+          format: "png"
+        });
+        if (typeof screenshotDataUrl === "string" && screenshotDataUrl.startsWith("data:image/")) {
+          const croppedDataUrl = await cropScreenshotToRegion(screenshotDataUrl, region.region);
+          screenshotId = makeId("shot");
+          state.attachments.push({
+            id: screenshotId,
+            type: "image/png",
+            source: "region-crop",
+            ts: nowIso(),
+            dataUrl: croppedDataUrl
+          });
+        }
+      } catch (error) {
+        debugLog("ADD_ANNOTATION_FOR_REGION:screenshot-failed", {
+          regionId,
+          message: error?.message || String(error)
+        });
+      } finally {
+        if (overlayHidden) {
+          await setOverlayVisibilityForCapture(state.tabId, true);
+        }
+      }
+    }
+
     const annotation = {
       id: makeId("ann"),
       ts: nowIso(),
@@ -664,9 +812,10 @@ async function addAnnotationForRegion({ tabId, regionId, comment, regionSnapshot
       comment: sanitizeValue(text),
       regionId: region.id,
       region: region.region,
+      selectionType: resolvedSelectionType,
       element: normalizeElement(region.element),
       linkedEventId: state.lastUiEvent?.id || null,
-      screenshotId: null
+      screenshotId
     };
 
     state.annotations.push(annotation);
@@ -675,7 +824,8 @@ async function addAnnotationForRegion({ tabId, regionId, comment, regionSnapshot
     debugLog("ADD_ANNOTATION_FOR_REGION:stored", {
       annotationId: annotation.id,
       regionId,
-      annotationsCount: state.annotations.length
+      annotationsCount: state.annotations.length,
+      screenshotId
     });
     return { ok: true, annotation };
   });
@@ -731,6 +881,7 @@ async function addLegacyElementSelection({ tabId, url, element, regionSnapshot }
       id: makeId("region"),
       ts: nowIso(),
       url: url || state.session.pageContext.url,
+      selectionType: "element",
       region,
       element: normalizeElement(element)
     };
@@ -1008,6 +1159,7 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
             regionId: String(message.regionId || ""),
             comment: message.comment,
             regionSnapshot: message.region,
+            selectionType: message.selectionType,
             element: message.element,
             url: message.url
           });

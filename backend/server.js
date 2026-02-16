@@ -195,7 +195,14 @@ function sanitizePayload(payload, config) {
         }
       : null;
 
-  return { session, timeline, regions, annotations, attachments, exportOptions };
+  return {
+    session,
+    timeline,
+    regions,
+    annotations,
+    attachments,
+    exportOptions
+  };
 }
 
 function validatePayload(payload) {
@@ -254,201 +261,402 @@ function compactElementSelector(element) {
   return compactCssSelector(element.cssSelector) || compactXpath(element.xpath);
 }
 
-function selectKeyTimelineEvents(timeline, maxSteps = 5) {
-  const KEY_TYPES = new Set([
-    "ui.element.select",
-    "ui.region.select",
-    "ui.region.note.add",
-    "ui.general.info.add",
-    "nav.change",
-    "js.error",
-    "js.unhandledrejection",
-    "console.error",
-    "network.failure"
-  ]);
-  const IMPORTANT_TYPES = new Set([
-    "ui.region.note.add",
-    "ui.general.info.add",
-    "js.error",
-    "js.unhandledrejection",
-    "console.error",
-    "network.failure"
-  ]);
-
-  const keyEvents = Array.isArray(timeline)
-    ? timeline.filter((event) => KEY_TYPES.has(event.type))
-    : [];
-
-  // Drop immediate duplicates (same type + same compact selector).
-  const deduped = [];
-  for (const event of keyEvents) {
-    const signature = `${event.type}|${compactElementSelector(event.element)}|${event.url || ""}`;
-    const last = deduped[deduped.length - 1];
-    if (last && last.__sig === signature) {
-      continue;
-    }
-    deduped.push({ ...event, __sig: signature });
-  }
-
-  const important = deduped.filter((event) => IMPORTANT_TYPES.has(event.type));
-  const selected = [];
-  const addedIds = new Set();
-
-  for (const event of important) {
-    if (selected.length >= maxSteps) {
-      break;
-    }
-    selected.push(event);
-    if (event.id) {
-      addedIds.add(event.id);
-    }
-  }
-
-  if (selected.length < 3) {
-    for (const event of deduped) {
-      if (selected.length >= maxSteps) {
-        break;
-      }
-      if (event.id && addedIds.has(event.id)) {
-        continue;
-      }
-      selected.push(event);
-      if (event.id) {
-        addedIds.add(event.id);
-      }
-    }
-  }
-
-  const trimmed = selected.length > maxSteps
-    ? selected.slice(selected.length - maxSteps)
-    : selected;
-
-  return trimmed
-    .sort((a, b) => Number(a.seq || 0) - Number(b.seq || 0))
-    .map(({ __sig, ...event }) => event);
+function normalizeForMatch(input) {
+  return String(input || "")
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase();
 }
 
-function buildMarkdown(reportId, payload) {
-  const regions = Array.isArray(payload.regions) ? payload.regions : [];
+function toUrlPath(input) {
+  try {
+    const value = String(input || "");
+    if (!value) {
+      return "";
+    }
+    const parsed = new URL(value);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return String(input || "");
+  }
+}
+
+function limitBullets(items, max) {
+  const result = [];
+  const seen = new Set();
+  for (const raw of items || []) {
+    const value = String(raw || "").trim();
+    if (!value) {
+      continue;
+    }
+    const sig = value.toLowerCase();
+    if (seen.has(sig)) {
+      continue;
+    }
+    seen.add(sig);
+    result.push(value);
+    if (result.length >= max) {
+      break;
+    }
+  }
+  return result;
+}
+
+function parseTimestampMs(input) {
+  const parsed = Date.parse(String(input || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function summarizeNoteTitle(note) {
+  const clean = String(note || "").replace(/\s+/g, " ").trim();
+  if (!clean) {
+    return "Uwagi do poprawy UI";
+  }
+  return clip(clean, 96);
+}
+
+function inferIssuePriority(notes) {
+  const text = normalizeForMatch((notes || []).join(" "));
+  if (/(crash|fatal|wywala|wywal[a-z]* blad|blokuje|nie dziala wcale|error 5\d\d)/.test(text)) {
+    return "P0";
+  }
+  if (/(blad|error|bug|problem|nie dziala|nie mozna|nie da sie)/.test(text)) {
+    return "P1";
+  }
+  return "P2";
+}
+
+function inferIssueType(notes) {
+  const text = normalizeForMatch((notes || []).join(" "));
+  if (/(logika|oblicz|wylicz|suma|procent|walidac)/.test(text)) {
+    return "logic";
+  }
+  if (/(css|html|layout|widok|screenshot|screen|obszar|element|przycisk|ikona)/.test(text)) {
+    return "ui";
+  }
+  return "ux";
+}
+
+function formatTrackerEventData(type, data) {
+  const payload = data && typeof data === "object" ? data : {};
+
+  if (type === "console.error") {
+    return String(payload.message || "console.error");
+  }
+  if (type === "js.error") {
+    return String(payload.message || "js.error");
+  }
+  if (type === "js.unhandledrejection") {
+    return String(payload.reason || "Unhandled rejection");
+  }
+  if (type === "network.failure") {
+    const method = String(payload.method || "GET");
+    const url = String(payload.url || "");
+    const status = payload.status != null ? String(payload.status) : "";
+    return [method, url, status].filter(Boolean).join(" ");
+  }
+  if (type === "ui.click") {
+    return `click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`;
+  }
+  if (type === "ui.input") {
+    const inputType = String(payload.inputType || "");
+    const value = clip(String(payload.value || ""), 80);
+    return `${inputType}${value ? ` value=${value}` : ""}`.trim();
+  }
+  if (type === "ui.scroll") {
+    return `scroll x=${Number(payload.scrollX || 0)} y=${Number(payload.scrollY || 0)}`;
+  }
+  if (type === "nav.change") {
+    return String(payload.url || payload.source || "nav.change");
+  }
+  return "";
+}
+
+function selectTrackerEvents(timeline, maxItems = 12) {
+  const TRACKER_EVENT_TYPES = new Set([
+    "ui.click",
+    "ui.input",
+    "ui.scroll",
+    "nav.change",
+    "console.error",
+    "network.failure",
+    "js.error",
+    "js.unhandledrejection"
+  ]);
+
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return [];
+  }
+
+  const filtered = timeline.filter((event) => TRACKER_EVENT_TYPES.has(String(event?.type || "")));
+  const tail = filtered.length > maxItems ? filtered.slice(filtered.length - maxItems) : filtered;
+
+  return tail.map((event) => ({
+    ts: String(event?.ts || ""),
+    type: String(event?.type || "unknown"),
+    urlPath: toUrlPath(event?.url || ""),
+    details: formatTrackerEventData(String(event?.type || ""), event?.data || {})
+  }));
+}
+
+function collectIssueDrafts(payload, maxIssues, maxBulletsPerSection) {
   const annotations = Array.isArray(payload.annotations) ? payload.annotations : [];
-  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
-  const keyTimeline = selectKeyTimelineEvents(payload.timeline, 5);
-  const oneLine = (value, max = 4000) =>
-    clip(String(value || "").replace(/\s+/g, " ").trim(), max);
+  const grouped = new Map();
+  const dedupe = new Set();
+  let duplicatesRemoved = 0;
+
+  for (const item of annotations) {
+    const note = String(item?.comment || "").trim();
+    if (!note) {
+      continue;
+    }
+
+    const selector = compactElementSelector(item?.element) || String(item?.element?.tagName || "");
+    const urlPath = toUrlPath(item?.url || payload.session?.pageContext?.url || "");
+    const dedupeKey = `${normalizeForMatch(note)}|${normalizeForMatch(selector)}|${urlPath}`;
+    if (dedupe.has(dedupeKey)) {
+      duplicatesRemoved += 1;
+      continue;
+    }
+    dedupe.add(dedupeKey);
+
+    const sectionKey = selector || String(item?.regionId || item?.scope || "general");
+    const groupKey = `${urlPath}|${sectionKey}`;
+    const tsMs = parseTimestampMs(item?.ts);
+
+    if (!grouped.has(groupKey)) {
+      grouped.set(groupKey, {
+        urlPath,
+        notes: [],
+        noteEntries: [],
+        selectors: new Set(),
+        screenshots: new Set(),
+        relatedCount: 0,
+        scope: String(item?.scope || "region"),
+        component: String(item?.element?.tagName || "Unknown"),
+        section: selector || String(item?.scope || "general"),
+        lastTsMs: tsMs
+      });
+    }
+
+    const group = grouped.get(groupKey);
+    group.notes.push(note);
+    group.noteEntries.push({ note, tsMs });
+    group.relatedCount += 1;
+    group.lastTsMs = Math.max(group.lastTsMs, tsMs);
+    if (selector) {
+      group.selectors.add(selector);
+    }
+    if (item?.screenshotId) {
+      group.screenshots.add(String(item.screenshotId));
+    }
+  }
+
+  const drafts = [];
+  const groups = Array.from(grouped.values());
+  groups.sort((a, b) => b.lastTsMs - a.lastTsMs);
+
+  const newestTsMs = groups.length > 0 ? groups[0].lastTsMs : 0;
+  const recentWindowMs = 60 * 60 * 1000;
+  const recentGroups =
+    newestTsMs > 0
+      ? groups.filter((group) => group.lastTsMs >= newestTsMs - recentWindowMs)
+      : groups;
+  const sourceGroups = recentGroups.length > 0 ? recentGroups : groups;
+
+  for (const group of sourceGroups.slice(0, maxIssues)) {
+    const orderedNotes = group.noteEntries
+      .slice()
+      .sort((a, b) => b.tsMs - a.tsMs)
+      .map((entry) => entry.note);
+    const sourceNotes = limitBullets(orderedNotes, maxBulletsPerSection);
+    const title = summarizeNoteTitle(sourceNotes[0] || "");
+    const type = inferIssueType(sourceNotes);
+    const priority = inferIssuePriority(sourceNotes);
+
+    drafts.push({
+      priority,
+      type,
+      title,
+      urlPath: group.urlPath,
+      component: group.component || "Unknown",
+      section: group.section || group.scope || "general",
+      selectors: Array.from(group.selectors).slice(0, 2),
+      sourceNotes,
+      screenshots: Array.from(group.screenshots).slice(0, 2),
+      relatedAnnotationsCount: group.relatedCount
+    });
+  }
+
+  return {
+    drafts,
+    totalAnnotations: annotations.length,
+    duplicatesRemoved
+  };
+}
+
+function buildMarkdown(reportId, payload, screenshotFileMap = {}) {
+  const maxIssues = 3;
+  const maxBulletsPerSection = 3;
+  const issues = collectIssueDrafts(payload, maxIssues, maxBulletsPerSection).drafts;
+  const trackerEvents = selectTrackerEvents(payload.timeline, 12);
+  const buildVersion = payload.session?.settings?.buildVersion || "n/a";
+  const language = "pl";
+  const appUrl = payload.session?.pageContext?.url || "";
 
   const lines = [];
-  lines.push(`# UI Feedback Report ${reportId}`);
+  lines.push("# UI Feedback Report (Deterministic)");
   lines.push("");
-  lines.push(`- Session ID: ${payload.session.id}`);
-  lines.push(`- Started: ${payload.session.startedAt || "n/a"}`);
-  lines.push(`- Ended: ${payload.session.endedAt || "n/a"}`);
-  lines.push(`- URL: ${payload.session.pageContext?.url || "n/a"}`);
-  lines.push(`- Title: ${payload.session.pageContext?.title || "n/a"}`);
-  if (keyTimeline.length > 0) {
+  lines.push("## Meta");
+  lines.push(`- report_id: ${reportId}`);
+  lines.push(`- session_id: ${payload.session?.id || "n/a"}`);
+  lines.push(`- app_url: ${appUrl || "n/a"}`);
+  lines.push(`- generated_at: ${nowIso()}`);
+  lines.push(`- build_version: ${buildVersion}`);
+  lines.push(`- language: ${language}`);
+  lines.push("");
+  lines.push("## Executive Summary");
+
+  if (issues.length === 0) {
+    lines.push("1. [P2][ux] Brak issue do raportowania (brak adnotacji).\n");
+  } else {
+    issues.forEach((item, idx) => {
+      lines.push(`${idx + 1}. [${item.priority}][${item.type}] ${item.title}`);
+    });
     lines.push("");
-    lines.push("## Timeline");
-    lines.push("");
-    for (const event of keyTimeline) {
-      const base = `${event.seq}. [${event.type}] ${event.ts} ${event.url}`;
-      lines.push(base);
-      const compactSelector = compactElementSelector(event.element);
-      if (compactSelector) {
-        lines.push(`   element: ${compactSelector}`);
-      }
-      if (event.causedByEventId) {
-        lines.push(`   causedByEventId: ${event.causedByEventId}`);
-      }
-    }
   }
 
-  lines.push("");
-  lines.push("## Regions");
+  lines.push("## Issues");
   lines.push("");
 
-  if (regions.length === 0) {
-    lines.push("- none");
-  } else {
-    for (const item of regions) {
-      const r = item.region || {};
-      lines.push(`- [${item.ts}] ${item.url}`);
-      lines.push(`  - Region: x=${r.pageX || 0}, y=${r.pageY || 0}, w=${r.width || 0}, h=${r.height || 0}`);
-      const compactSelector = compactElementSelector(item.element);
-      if (compactSelector) {
-        lines.push(`  - Center element: ${compactSelector}`);
-      }
-      if (item.element?.cssSnapshot) {
-        lines.push("  - CSS attached: yes");
-      }
-      if (item.element?.outerHtmlSnippet) {
-        lines.push("  - HTML attached: yes");
-      }
+  issues.forEach((item, idx) => {
+    const issueId = `ISSUE-${String(idx + 1).padStart(3, "0")}`;
+    lines.push(`### ${issueId}`);
+    lines.push(`- priority: ${item.priority}`);
+    lines.push(`- type: ${item.type}`);
+    lines.push(`- title: ${item.title}`);
+    lines.push(`- related_annotations_count: ${item.relatedAnnotationsCount || 0}`);
+    lines.push("- source_notes:");
+
+    const sourceNotes = limitBullets(item.sourceNotes, maxBulletsPerSection);
+    if (sourceNotes.length === 0) {
+      lines.push('  - "-"');
+    } else {
+      sourceNotes.forEach((note) => lines.push(`  - "${note}"`));
     }
-  }
 
-  lines.push("");
-  lines.push("## Annotations");
-  lines.push("");
+    lines.push("");
+    lines.push("#### Scope");
+    lines.push(`- url: ${item.urlPath || toUrlPath(appUrl) || "n/a"}`);
+    lines.push(`- component: ${item.component || "Unknown"}`);
+    lines.push(`- section: ${item.section || "Unknown"}`);
+    lines.push("- selectors:");
+    if (item.selectors.length === 0) {
+      lines.push("  - n/a");
+    } else {
+      item.selectors.forEach((selector) => lines.push(`  - ${selector}`));
+    }
 
-  if (annotations.length === 0) {
-    lines.push("- none");
-  } else {
-    for (const item of annotations) {
-      lines.push(`- [${item.ts}] ${item.comment}`);
-      if (item.scope === "general") {
-        lines.push("  - Scope: General");
-      }
-      lines.push(`  - URL: ${item.url}`);
-      if (item.region) {
-        lines.push(`  - Region: x=${item.region.pageX || 0}, y=${item.region.pageY || 0}, w=${item.region.width || 0}, h=${item.region.height || 0}`);
-      }
-      if (item.regionId) {
-        lines.push(`  - Region ID: ${item.regionId}`);
-      }
-      const compactSelector = compactElementSelector(item.element);
-      if (compactSelector) {
-        lines.push(`  - Element: ${compactSelector}`);
-      }
-      if (item.element?.text) {
-        lines.push(`  - Element text: ${oneLine(item.element.text, 280)}`);
-      }
-      if (item.element?.cssSnapshot) {
-        lines.push("  - Element CSS (attached):");
-        lines.push("```css");
-        lines.push(String(item.element.cssSnapshot));
-        lines.push("```");
-        if (Array.isArray(item.element.cssSources) && item.element.cssSources.length > 0) {
-          lines.push("  - CSS sources:");
-          for (const src of item.element.cssSources.slice(0, 20)) {
-            const href = src.stylesheetHref || "[unknown]";
-            const selector = src.selector || "[selector?]";
-            const media = src.media ? ` @media ${src.media}` : "";
-            const sourceType = src.sourceType ? `${src.sourceType}` : "stylesheet";
-            lines.push(`    - ${sourceType}: ${href} | ${selector}${media}`);
-          }
+    lines.push("");
+    lines.push("#### Evidence");
+    lines.push("- screenshots:");
+    if (item.screenshots.length === 0) {
+      lines.push("  - none");
+    } else {
+      item.screenshots.forEach((shot) => {
+        const mapped = screenshotFileMap[shot];
+        if (mapped) {
+          lines.push(`  - ${mapped} (${shot})`);
+          return;
         }
-      }
-      if (item.element?.outerHtmlSnippet) {
-        lines.push("  - Element HTML (attached):");
-        lines.push("```html");
-        lines.push(String(item.element.outerHtmlSnippet));
-        lines.push("```");
-      }
-      if (item.linkedEventId) {
-        lines.push(`  - Linked event: ${item.linkedEventId}`);
-      }
-      if (item.screenshotId) {
-        lines.push(`  - Screenshot: ${item.screenshotId}`);
-      }
+        lines.push(`  - ${shot}`);
+      });
     }
-  }
 
-  lines.push("");
-  lines.push("## Attachments");
-  lines.push("");
-  lines.push(`- Count: ${attachments.length}`);
-  lines.push("");
+    lines.push("");
+  });
+
+  if (trackerEvents.length > 0) {
+    lines.push("## Rejestr zdarzen i bledow");
+    lines.push("");
+    trackerEvents.forEach((event, index) => {
+      const parts = [
+        `${index + 1}.`,
+        event.type,
+        event.urlPath ? `@ ${event.urlPath}` : "",
+        event.details ? `- ${event.details}` : ""
+      ].filter(Boolean);
+      const tsLabel = event.ts ? ` (${event.ts})` : "";
+      lines.push(`${parts.join(" ")}${tsLabel}`);
+    });
+    lines.push("");
+  }
 
   return lines.join("\n");
+}
+
+function parseDataUrl(dataUrl) {
+  if (typeof dataUrl !== "string") {
+    return null;
+  }
+  const match = dataUrl.match(/^data:([^;,]+);base64,(.+)$/);
+  if (!match) {
+    return null;
+  }
+  try {
+    return {
+      mime: String(match[1] || "").toLowerCase(),
+      buffer: Buffer.from(match[2], "base64")
+    };
+  } catch {
+    return null;
+  }
+}
+
+function mimeToExtension(mime) {
+  const map = {
+    "image/png": "png",
+    "image/jpeg": "jpg",
+    "image/webp": "webp",
+    "image/gif": "gif"
+  };
+  return map[mime] || "bin";
+}
+
+async function exportScreenshotFiles(payload, outputDir, reportId) {
+  const screenshotFileMap = {};
+  const attachments = Array.isArray(payload.attachments) ? payload.attachments : [];
+  if (attachments.length === 0) {
+    return screenshotFileMap;
+  }
+
+  const assetsDirName = `${reportId}-assets`;
+  const assetsDir = path.join(outputDir, assetsDirName);
+  let assetsDirReady = false;
+
+  for (const item of attachments) {
+    const attachmentId = String(item?.id || "").trim();
+    if (!attachmentId) {
+      continue;
+    }
+    const parsed = parseDataUrl(item?.dataUrl);
+    if (!parsed || !parsed.mime.startsWith("image/")) {
+      continue;
+    }
+
+    if (!assetsDirReady) {
+      await fsp.mkdir(assetsDir, { recursive: true });
+      assetsDirReady = true;
+    }
+
+    const ext = mimeToExtension(parsed.mime);
+    const fileName = `${attachmentId}.${ext}`;
+    const filePath = path.join(assetsDir, fileName);
+    await fsp.writeFile(filePath, parsed.buffer);
+    screenshotFileMap[attachmentId] = path.join(assetsDirName, fileName).replace(/\\/g, "/");
+  }
+
+  return screenshotFileMap;
 }
 
 async function writeReport(payload, config) {
@@ -494,9 +702,10 @@ async function writeReport(payload, config) {
   const mdPath = path.join(config.outputDir, `${finalStem}.md`);
 
   await fsp.writeFile(jsonPath, JSON.stringify(payload, null, 2), "utf8");
+  const screenshotFileMap = await exportScreenshotFiles(payload, config.outputDir, finalStem);
 
   if (config.writeMarkdown) {
-    const markdown = buildMarkdown(reportId, payload);
+    const markdown = buildMarkdown(reportId, payload, screenshotFileMap);
     await fsp.writeFile(mdPath, markdown, "utf8");
   }
 
