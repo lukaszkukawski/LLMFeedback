@@ -1,23 +1,50 @@
+const DOMAIN_SETTINGS_KEY = "uiFeedbackDomainSettings";
+
+const domainEl = document.getElementById("domain");
+const toggleBtn = document.getElementById("toggleBtn");
 const statusEl = document.getElementById("status");
-const selectedMetaEl = document.getElementById("selectedMeta");
-const countsMetaEl = document.getElementById("countsMeta");
-const messageEl = document.getElementById("message");
-const commentEl = document.getElementById("comment");
 
-const newSessionBtn = document.getElementById("newSessionBtn");
-const markAreaBtn = document.getElementById("markAreaBtn");
-const pickElementBtn = document.getElementById("pickElementBtn");
-const addAnnotationBtn = document.getElementById("addAnnotationBtn");
-const exportBtn = document.getElementById("exportBtn");
-const jsonBtn = document.getElementById("jsonBtn");
+let activeTab = null;
+let activeDomain = "";
+let domainEnabled = true;
 
-function setMessage(text, isError = false) {
-  messageEl.textContent = text;
-  messageEl.style.color = isError ? "#b42318" : "#1d3e74";
+function setStatus(text, isError = false) {
+  statusEl.textContent = text || "";
+  statusEl.classList.toggle("error", !!isError);
 }
 
-function callRuntime(message) {
-  return chrome.runtime.sendMessage(message);
+function getDomainFromUrl(url) {
+  if (!url) {
+    return "";
+  }
+  try {
+    const parsed = new URL(url);
+    if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+      return "";
+    }
+    return String(parsed.hostname || "").toLowerCase();
+  } catch {
+    return "";
+  }
+}
+
+function renderToggle() {
+  toggleBtn.classList.remove("on", "off");
+
+  if (!activeDomain) {
+    toggleBtn.textContent = "Ta strona nie obsługuje przełącznika domeny";
+    toggleBtn.disabled = true;
+    return;
+  }
+
+  toggleBtn.disabled = false;
+  if (domainEnabled) {
+    toggleBtn.textContent = "Wyłącz na tej domenie";
+    toggleBtn.classList.add("on");
+  } else {
+    toggleBtn.textContent = "Włącz na tej domenie";
+    toggleBtn.classList.add("off");
+  }
 }
 
 async function getActiveTab() {
@@ -25,168 +52,131 @@ async function getActiveTab() {
   return tabs[0] || null;
 }
 
-function short(value, len = 90) {
-  if (!value) {
-    return "";
+async function readDomainState(domain) {
+  const result = await chrome.storage.local.get(DOMAIN_SETTINGS_KEY);
+  const map = result?.[DOMAIN_SETTINGS_KEY];
+  if (!map || typeof map !== "object") {
+    return true;
   }
-  return value.length > len ? `${value.slice(0, len)}...` : value;
+  return map[domain] !== false;
 }
 
-function formatRegion(region) {
-  if (!region) {
-    return "brak";
-  }
-
-  const x = region.pageX ?? 0;
-  const y = region.pageY ?? 0;
-  const w = region.width ?? 0;
-  const h = region.height ?? 0;
-  return `x=${x}, y=${y}, w=${w}, h=${h}`;
+async function writeDomainState(domain, enabled) {
+  const result = await chrome.storage.local.get(DOMAIN_SETTINGS_KEY);
+  const map =
+    result?.[DOMAIN_SETTINGS_KEY] && typeof result[DOMAIN_SETTINGS_KEY] === "object"
+      ? { ...result[DOMAIN_SETTINGS_KEY] }
+      : {};
+  map[domain] = !!enabled;
+  await chrome.storage.local.set({ [DOMAIN_SETTINGS_KEY]: map });
 }
 
-async function ensureContentScript(tabId) {
-  try {
-    await chrome.tabs.sendMessage(tabId, { type: "PING" });
-  } catch (_error) {
-    await chrome.scripting.executeScript({
-      target: { tabId },
-      files: ["content.js"]
-    });
-  }
-}
-
-async function initSession(reset = false) {
-  const tab = await getActiveTab();
-  if (!tab?.id) {
-    return { ok: false, error: "Brak aktywnej karty." };
-  }
-
-  await ensureContentScript(tab.id);
-  return callRuntime({ type: "INIT_SESSION", tab, reset });
-}
-
-async function refreshUi() {
-  const response = await callRuntime({ type: "GET_STATE" });
-  if (!response.ok) {
-    setMessage(response.error || "Nie udało się pobrać stanu.", true);
-    return;
-  }
-
-  const state = response.state;
-  const timeline = Array.isArray(state.timeline) ? state.timeline : [];
-  const regions = Array.isArray(state.regions) ? state.regions : [];
-  const annotations = Array.isArray(state.annotations) ? state.annotations : [];
-
-  statusEl.textContent = `Sesja: ${state.sessionActive ? "aktywna" : "brak"}`;
-
-  selectedMetaEl.textContent = state.selectedRegion
-    ? `Wybrany obszar: ${formatRegion(state.selectedRegion.region)} (${short(state.selectedRegion.url)})`
-    : "Wybrany obszar: brak";
-
-  countsMetaEl.textContent = `Kroki: ${timeline.length} | Obszary: ${regions.length} | Notatki: ${annotations.length}`;
-}
-
-newSessionBtn.addEventListener("click", async () => {
-  const response = await initSession(true);
-  if (!response.ok) {
-    setMessage(response.error || "Nie udało się utworzyć sesji.", true);
-    return;
-  }
-
-  setMessage("Wyczyszczono sesję.");
-  await refreshUi();
-});
-
-markAreaBtn.addEventListener("click", async () => {
-  const initResponse = await initSession(false);
-  if (!initResponse.ok) {
-    setMessage(initResponse.error || "Nie udało się przygotować sesji.", true);
-    return;
-  }
-
-  const tab = await getActiveTab();
-  if (!tab?.id) {
-    setMessage("Brak aktywnej karty.", true);
-    return;
-  }
-
-  const response = await chrome.tabs.sendMessage(tab.id, { type: "START_REGION_MODE" });
-  if (!response?.ok) {
-    setMessage(response?.error || "Nie udało się uruchomić trybu zaznaczania.", true);
-    return;
-  }
-
-  setMessage("Rysuj prostokąt na stronie. ESC anuluje.");
-});
-
-pickElementBtn.addEventListener("click", async () => {
-  const initResponse = await initSession(false);
-  if (!initResponse.ok) {
-    setMessage(initResponse.error || "Nie udało się przygotować sesji.", true);
-    return;
-  }
-
-  const tab = await getActiveTab();
-  if (!tab?.id) {
-    setMessage("Brak aktywnej karty.", true);
-    return;
-  }
-
-  const response = await chrome.tabs.sendMessage(tab.id, { type: "START_ELEMENT_MODE" });
-  if (!response?.ok) {
-    setMessage(response?.error || "Nie udało się uruchomić trybu wyboru elementu.", true);
-    return;
-  }
-
-  setMessage("Kliknij docelowy element na stronie. ESC anuluje.");
-});
-
-addAnnotationBtn.addEventListener("click", async () => {
-  const comment = commentEl.value.trim();
-  if (!comment) {
-    setMessage("Wpisz notatkę.", true);
-    return;
-  }
-
-  const tab = await getActiveTab();
-  const response = await callRuntime({
-    type: "ADD_ANNOTATION",
-    comment,
-    tabId: tab?.id || null
+async function reinjectContentScript(tabId) {
+  // Clean orphaned UI from a stale/invalidated content-script context.
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    func: () => {
+      const nodes = document.querySelectorAll(
+        "[data-ui-feedback-control='1'], [data-ui-feedback-editor='1'], [data-ui-feedback-region-id]"
+      );
+      for (const node of nodes) {
+        if (node instanceof HTMLElement) {
+          node.remove();
+        }
+      }
+      document.documentElement.style.cursor = "";
+      document.body.style.cursor = "";
+      try {
+        delete window.__UI_FEEDBACK_RECORDER_V2_INSTALLED__;
+      } catch {
+        // Ignore non-configurable property edge-cases.
+      }
+    }
   });
 
-  if (!response.ok) {
-    setMessage(response.error || "Nie udało się dodać notatki.", true);
+  await chrome.scripting.executeScript({
+    target: { tabId },
+    files: ["content.js"]
+  });
+}
+
+async function applyTabState(enabled) {
+  if (!activeTab?.id) {
+    return;
+  }
+  try {
+    await chrome.tabs.sendMessage(activeTab.id, {
+      type: "SET_DOMAIN_ENABLED",
+      enabled
+    });
+    return;
+  } catch {
+    // Recover from stale "Extension context invalidated" scripts after extension reload.
+  }
+
+  try {
+    await reinjectContentScript(activeTab.id);
+    await chrome.tabs.sendMessage(activeTab.id, {
+      type: "SET_DOMAIN_ENABLED",
+      enabled
+    });
+  } catch {
+    throw new Error("Nie udało się zsynchronizować strony. Odśwież kartę i spróbuj ponownie.");
+  }
+}
+
+async function syncCurrentTabStateFromStorage() {
+  if (!activeDomain) {
+    return;
+  }
+  const enabled = await readDomainState(activeDomain);
+  domainEnabled = enabled;
+  renderToggle();
+  try {
+    await applyTabState(enabled);
+  } catch {
+    // If this page blocks scripting/messaging, keep popup state only.
+  }
+}
+
+toggleBtn.addEventListener("click", async () => {
+  if (!activeDomain) {
     return;
   }
 
-  commentEl.value = "";
-  setMessage("Dodano notatkę do zaznaczonego obszaru.");
-  await refreshUi();
-});
-
-exportBtn.addEventListener("click", async () => {
-  const response = await callRuntime({ type: "EXPORT_TO_BACKEND" });
-  if (!response.ok) {
-    const queuedInfo = response.queuedId ? ` (kolejka: ${response.queuedId})` : "";
-    setMessage(`Błąd wysyłki: ${response.error}${queuedInfo}`, true);
-    return;
+  const next = !domainEnabled;
+  try {
+    await writeDomainState(activeDomain, next);
+    domainEnabled = next;
+    renderToggle();
+    await applyTabState(next);
+    setStatus(next ? "Włączono dla tej domeny." : "Wyłączono dla tej domeny.");
+  } catch (error) {
+    setStatus(error?.message || "Nie udało się zapisać ustawienia.", true);
   }
-
-  const result = response.result || {};
-  setMessage(`Zapisano raport: ${result.reportId || "ok"}`);
 });
 
-jsonBtn.addEventListener("click", async () => {
-  const response = await callRuntime({ type: "EXPORT_JSON_FILE" });
-  if (!response.ok) {
-    setMessage(response.error || "Export JSON nieudany.", true);
-    return;
+async function init() {
+  try {
+    activeTab = await getActiveTab();
+    activeDomain = getDomainFromUrl(activeTab?.url || "");
+
+    domainEl.textContent = activeDomain ? `Domena: ${activeDomain}` : "Domena: nieobsługiwana";
+
+    if (!activeDomain) {
+      renderToggle();
+      setStatus("Dla tej strony przełącznik domeny jest niedostępny.", true);
+      return;
+    }
+
+    domainEnabled = await readDomainState(activeDomain);
+    renderToggle();
+    setStatus(domainEnabled ? "Rozszerzenie jest aktywne na tej domenie." : "Rozszerzenie jest wyłączone na tej domenie.");
+    await syncCurrentTabStateFromStorage();
+  } catch (error) {
+    setStatus(error?.message || "Błąd inicjalizacji popupu.", true);
+    toggleBtn.disabled = true;
   }
+}
 
-  setMessage(`Wyeksportowano ${response.fileName}`);
-});
-
-refreshUi().catch((error) => {
-  setMessage(error.message || "Błąd inicjalizacji popupu.", true);
-});
+init();

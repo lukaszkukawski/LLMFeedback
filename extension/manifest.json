@@ -8,7 +8,6 @@
     "scripting",
     "storage",
     "tabs",
-    "downloads",
     "webNavigation"
   ],
   "host_permissions": [
@@ -38,6 +37,7 @@
     "128": "icons/icon128.png"
   },
   "action": {
+    "default_popup": "popup.html",
     "default_title": "LLM Feedback",
     "default_icon": {
       "16": "icons/icon16.png",

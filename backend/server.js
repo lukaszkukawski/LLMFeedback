@@ -25,9 +25,9 @@ function loadConfig() {
   return {
     outputDir: path.resolve(__dirname, cfg.outputDir || "./reports"),
     writeMarkdown: cfg.writeMarkdown !== false,
-    maxOuterHtmlChars: Number(cfg.maxOuterHtmlChars || 200000),
-    maxCssChars: Number(cfg.maxCssChars || 40000),
-    maxTextChars: Number(cfg.maxTextChars || 20000),
+    maxOuterHtmlChars: Number(cfg.maxOuterHtmlChars || 1000000),
+    maxCssChars: Number(cfg.maxCssChars || 120000),
+    maxTextChars: Number(cfg.maxTextChars || 50000),
     maxAttachmentChars: Number(cfg.maxAttachmentChars || 5000000),
     maskPasswordInputs: cfg.maskPasswordInputs !== false,
     sensitivePatterns: (cfg.sensitivePatterns || []).map((pattern) => new RegExp(pattern, "gi"))
@@ -79,9 +79,13 @@ function sanitizeElement(element, config) {
   }
 
   const next = {
-    cssSelector: clip(maskString(element.cssSelector || "", config), 500),
-    xpath: clip(maskString(element.xpath || "", config), 1000),
+    cssSelector: clip(maskString(element.cssSelector || "", config), 2000),
+    stableSelector: clip(maskString(element.stableSelector || "", config), 2000),
+    xpath: clip(maskString(element.xpath || "", config), 3000),
     text: clip(maskString(element.text || "", config), config.maxTextChars),
+    textCompact: clip(maskString(element.textCompact || "", config), 500),
+    nearestLabelOrHeading: clip(maskString(element.nearestLabelOrHeading || "", config), 400),
+    compactHtmlSnippet: clip(maskString(element.compactHtmlSnippet || "", config), 3000),
     outerHtmlSnippet: clip(maskString(element.outerHtmlSnippet || "", config), config.maxOuterHtmlChars),
     cssSnapshot: clip(maskString(element.cssSnapshot || "", config), config.maxCssChars),
     cssSources: Array.isArray(element.cssSources)
@@ -94,6 +98,7 @@ function sanitizeElement(element, config) {
       : [],
     rect: element.rect || null,
     tagName: element.tagName || null,
+    role: clip(maskString(element.role || "", config), 80),
     inputType: element.inputType || null
   };
 
@@ -122,6 +127,34 @@ function sanitizeRegion(region) {
     viewportW: Number(region.viewportW || 0),
     viewportH: Number(region.viewportH || 0)
   };
+}
+
+function sanitizeAutoContext(autoContext, config) {
+  if (!autoContext || typeof autoContext !== "object") {
+    return null;
+  }
+  return {
+    urlPath: clip(maskString(String(autoContext.urlPath || ""), config), 500),
+    selectionType: clip(String(autoContext.selectionType || ""), 40),
+    selectorStable: clip(maskString(String(autoContext.selectorStable || ""), config), 2000),
+    elementText: clip(maskString(String(autoContext.elementText || ""), config), 600),
+    nearestLabelOrHeading: clip(maskString(String(autoContext.nearestLabelOrHeading || ""), config), 500),
+    tag: clip(String(autoContext.tag || ""), 60),
+    role: clip(maskString(String(autoContext.role || ""), config), 80),
+    htmlSnippetCompact: clip(maskString(String(autoContext.htmlSnippetCompact || ""), config), 4000)
+  };
+}
+
+function sanitizeReproWindow(reproWindow, config) {
+  if (!Array.isArray(reproWindow)) {
+    return [];
+  }
+  return reproWindow.slice(0, 8).map((entry) => ({
+    ts: String(entry?.ts || ""),
+    type: clip(String(entry?.type || "unknown"), 80),
+    url: clip(maskString(String(entry?.url || ""), config), 500),
+    details: clip(maskString(String(entry?.details || ""), config), 240)
+  }));
 }
 
 function sanitizePayload(payload, config) {
@@ -158,8 +191,11 @@ function sanitizePayload(payload, config) {
         regionId: item.regionId || null,
         region: sanitizeRegion(item.region),
         element: sanitizeElement(item.element, config),
+        selectionType: item.selectionType === "element" ? "element" : item.selectionType === "general" ? "general" : "area",
         linkedEventId: item.linkedEventId || null,
-        screenshotId: item.screenshotId || null
+        screenshotId: item.screenshotId || null,
+        autoContext: sanitizeAutoContext(item.autoContext, config),
+        reproWindow: sanitizeReproWindow(item.reproWindow, config)
       }))
     : [];
 
@@ -201,6 +237,7 @@ function sanitizePayload(payload, config) {
     regions,
     annotations,
     attachments,
+    globalScreenshotId: payload.globalScreenshotId || null,
     exportOptions
   };
 }
@@ -495,104 +532,209 @@ function collectIssueDrafts(payload, maxIssues, maxBulletsPerSection) {
   };
 }
 
+function buildIssuesFromAnnotations(payload) {
+  const annotations = Array.isArray(payload.annotations) ? payload.annotations : [];
+  const sorted = annotations
+    .filter((item) => String(item?.comment || "").trim())
+    .slice()
+    .sort((a, b) => parseTimestampMs(a?.ts) - parseTimestampMs(b?.ts));
+
+  return sorted.map((item) => {
+    const auto = item?.autoContext || {};
+    const element = item?.element || {};
+    const stableSelectorCandidate = String(auto.selectorStable || element.stableSelector || "").trim();
+    const cssSelectorCandidate = String(element.cssSelector || "").trim();
+    const xpathCandidate = String(element.xpath || "").trim();
+    const selectorStable =
+      stableSelectorCandidate ||
+      cssSelectorCandidate ||
+      xpathCandidate ||
+      compactElementSelector(element) ||
+      "n/a";
+    const selectionType =
+      String(auto.selectionType || item?.selectionType || "").trim() || "area";
+    const elementText = clip(
+      String(auto.elementText || element.textCompact || element.text || "")
+        .replace(/\s+/g, " ")
+        .trim(),
+      160
+    ) || "none";
+    const nearestLabelOrHeading = clip(
+      String(auto.nearestLabelOrHeading || element.nearestLabelOrHeading || "")
+        .replace(/\s+/g, " ")
+        .trim(),
+      120
+    ) || "none";
+    const htmlSnippetCompact = clip(
+      String(auto.htmlSnippetCompact || element.compactHtmlSnippet || "")
+        .replace(/\s+/g, " ")
+        .trim(),
+      1400
+    ) || "none";
+    const htmlFull = String(element.outerHtmlSnippet || "").trim();
+    const urlPath = toUrlPath(auto.urlPath || item?.url || payload.session?.pageContext?.url || "");
+    const tag = String(auto.tag || element.tagName || "none").toLowerCase();
+    const role = String(auto.role || element.role || "none");
+    const note = String(item?.comment || "").trim();
+    const reproSteps = Array.isArray(item?.reproWindow) ? item.reproWindow.slice(0, 5) : [];
+
+    return {
+      id: item?.id || null,
+      ts: item?.ts || "",
+      userNote: note,
+      urlPath,
+      selectionType,
+      selectorStable,
+      cssSelector: cssSelectorCandidate || "none",
+      xpath: xpathCandidate || "none",
+      tag,
+      role: role || "none",
+      elementText,
+      nearestLabelOrHeading,
+      htmlSnippetCompact,
+      htmlFull: htmlFull || "",
+      screenshotId: item?.screenshotId || null,
+      reproSteps
+    };
+  });
+}
+
+function escapeCodeFence(input) {
+  return String(input || "").replace(/```/g, "``\\`");
+}
+
 function buildMarkdown(reportId, payload, screenshotFileMap = {}) {
-  const maxIssues = 3;
-  const maxBulletsPerSection = 3;
-  const issues = collectIssueDrafts(payload, maxIssues, maxBulletsPerSection).drafts;
-  const trackerEvents = selectTrackerEvents(payload.timeline, 12);
-  const buildVersion = payload.session?.settings?.buildVersion || "n/a";
-  const language = "pl";
+  const issues = buildIssuesFromAnnotations(payload);
   const appUrl = payload.session?.pageContext?.url || "";
+  const globalScreenshotId = String(payload.globalScreenshotId || "");
+  const globalScreenshotPath = globalScreenshotId ? screenshotFileMap[globalScreenshotId] || "" : "";
 
   const lines = [];
-  lines.push("# UI Feedback Report (Deterministic)");
+  lines.push("# Raport UI Feedback");
   lines.push("");
   lines.push("## Meta");
   lines.push(`- report_id: ${reportId}`);
   lines.push(`- session_id: ${payload.session?.id || "n/a"}`);
   lines.push(`- app_url: ${appUrl || "n/a"}`);
   lines.push(`- generated_at: ${nowIso()}`);
-  lines.push(`- build_version: ${buildVersion}`);
-  lines.push(`- language: ${language}`);
+  lines.push(`- issues_count: ${issues.length}`);
   lines.push("");
-  lines.push("## Executive Summary");
+  lines.push("## Dowody Globalne");
+  lines.push(`- viewport_screenshot: ${globalScreenshotPath || "none"}`);
+  lines.push("");
+  lines.push("## Problemy");
+  lines.push("");
 
   if (issues.length === 0) {
-    lines.push("1. [P2][ux] Brak issue do raportowania (brak adnotacji).\n");
-  } else {
-    issues.forEach((item, idx) => {
-      lines.push(`${idx + 1}. [${item.priority}][${item.type}] ${item.title}`);
-    });
+    lines.push("Brak adnotacji do zapisania.");
     lines.push("");
+    return lines.join("\n");
   }
-
-  lines.push("## Issues");
-  lines.push("");
 
   issues.forEach((item, idx) => {
     const issueId = `ISSUE-${String(idx + 1).padStart(3, "0")}`;
     lines.push(`### ${issueId}`);
-    lines.push(`- priority: ${item.priority}`);
-    lines.push(`- type: ${item.type}`);
-    lines.push(`- title: ${item.title}`);
-    lines.push(`- related_annotations_count: ${item.relatedAnnotationsCount || 0}`);
-    lines.push("- source_notes:");
+    lines.push(`- created_at: ${item.ts || "n/a"}`);
+    lines.push(`- user_note: "${item.userNote}"`);
 
-    const sourceNotes = limitBullets(item.sourceNotes, maxBulletsPerSection);
-    if (sourceNotes.length === 0) {
-      lines.push('  - "-"');
-    } else {
-      sourceNotes.forEach((note) => lines.push(`  - "${note}"`));
+    lines.push("");
+    lines.push("#### Zakres");
+    lines.push(`- url_path: ${item.urlPath || toUrlPath(appUrl) || "n/a"}`);
+    lines.push(`- selection_type: ${item.selectionType || "area"}`);
+    lines.push(`- selector_stable: ${item.selectorStable || "n/a"}`);
+    if (item.cssSelector && item.cssSelector !== "none") {
+      lines.push(`- selector_css: ${item.cssSelector}`);
+    }
+    if (item.xpath && item.xpath !== "none") {
+      lines.push(`- selector_xpath: ${item.xpath}`);
+    }
+    lines.push(`- tag: ${item.tag || "none"}`);
+    lines.push(`- role: ${item.role || "none"}`);
+
+    lines.push("");
+    lines.push("#### Kontekst");
+    lines.push(`- element_text: "${item.elementText}"`);
+    lines.push(`- nearest_label_or_heading: "${item.nearestLabelOrHeading}"`);
+    lines.push(`- html_snippet_compact: "${item.htmlSnippetCompact}"`);
+    if (item.htmlFull) {
+      lines.push("");
+      lines.push("#### HTML (pełny, załączony)");
+      lines.push("```html");
+      lines.push(escapeCodeFence(item.htmlFull));
+      lines.push("```");
     }
 
     lines.push("");
-    lines.push("#### Scope");
-    lines.push(`- url: ${item.urlPath || toUrlPath(appUrl) || "n/a"}`);
-    lines.push(`- component: ${item.component || "Unknown"}`);
-    lines.push(`- section: ${item.section || "Unknown"}`);
-    lines.push("- selectors:");
-    if (item.selectors.length === 0) {
-      lines.push("  - n/a");
+    lines.push("#### Dowody");
+    if (item.screenshotId && screenshotFileMap[item.screenshotId]) {
+      lines.push(`- screenshot: ${screenshotFileMap[item.screenshotId]} (${item.screenshotId})`);
     } else {
-      item.selectors.forEach((selector) => lines.push(`  - ${selector}`));
+      lines.push("- screenshot: none");
     }
 
     lines.push("");
-    lines.push("#### Evidence");
-    lines.push("- screenshots:");
-    if (item.screenshots.length === 0) {
-      lines.push("  - none");
+    lines.push("#### Kroki Reprodukcji");
+    if (!Array.isArray(item.reproSteps) || item.reproSteps.length === 0) {
+      lines.push("1. none");
     } else {
-      item.screenshots.forEach((shot) => {
-        const mapped = screenshotFileMap[shot];
-        if (mapped) {
-          lines.push(`  - ${mapped} (${shot})`);
-          return;
-        }
-        lines.push(`  - ${shot}`);
+      item.reproSteps.slice(0, 5).forEach((step, stepIndex) => {
+        const parts = [
+          `${step.type || "unknown"}`,
+          step.url ? `@ ${toUrlPath(step.url)}` : "",
+          step.details ? `- ${step.details}` : "",
+          step.ts ? `(${step.ts})` : ""
+        ].filter(Boolean);
+        lines.push(`${stepIndex + 1}. ${parts.join(" ")}`);
       });
     }
-
     lines.push("");
   });
 
-  if (trackerEvents.length > 0) {
-    lines.push("## Rejestr zdarzen i bledow");
-    lines.push("");
-    trackerEvents.forEach((event, index) => {
-      const parts = [
-        `${index + 1}.`,
-        event.type,
-        event.urlPath ? `@ ${event.urlPath}` : "",
-        event.details ? `- ${event.details}` : ""
-      ].filter(Boolean);
-      const tsLabel = event.ts ? ` (${event.ts})` : "";
-      lines.push(`${parts.join(" ")}${tsLabel}`);
-    });
-    lines.push("");
-  }
-
   return lines.join("\n");
+}
+
+function buildJsonReport(reportId, payload, screenshotFileMap = {}) {
+  const appUrl = payload.session?.pageContext?.url || "";
+  const globalScreenshotId = String(payload.globalScreenshotId || "");
+  const globalScreenshotPath = globalScreenshotId ? screenshotFileMap[globalScreenshotId] || "" : "";
+
+  const issues = buildIssuesFromAnnotations(payload).map((issue, index) => ({
+    issueId: `ISSUE-${String(index + 1).padStart(3, "0")}`,
+    createdAt: issue.ts || "",
+    userNote: issue.userNote || "",
+    scope: {
+      urlPath: issue.urlPath || toUrlPath(appUrl) || "n/a",
+      selectionType: issue.selectionType || "area",
+      selectorStable: issue.selectorStable || "n/a",
+      selectorCss: issue.cssSelector || "none",
+      selectorXpath: issue.xpath || "none",
+      tag: issue.tag || "none",
+      role: issue.role || "none"
+    },
+    context: {
+      elementText: issue.elementText || "none",
+      nearestLabelOrHeading: issue.nearestLabelOrHeading || "none",
+      htmlSnippetCompact: issue.htmlSnippetCompact || "none",
+      htmlFull: issue.htmlFull || ""
+    },
+    evidence: {
+      screenshot: issue.screenshotId ? screenshotFileMap[issue.screenshotId] || "none" : "none",
+      screenshotId: issue.screenshotId || null
+    },
+    reproSteps: Array.isArray(issue.reproSteps) ? issue.reproSteps : []
+  }));
+
+  return {
+    reportId,
+    generatedAt: nowIso(),
+    sessionId: payload.session?.id || "n/a",
+    appUrl: appUrl || "n/a",
+    globalEvidence: {
+      viewportScreenshot: globalScreenshotPath || "none",
+      viewportScreenshotId: globalScreenshotId || null
+    },
+    issues
+  };
 }
 
 function parseDataUrl(dataUrl) {
@@ -689,7 +831,7 @@ async function writeReport(payload, config) {
     const candidateJson = path.join(config.outputDir, `${finalStem}.json`);
     const candidateMd = path.join(config.outputDir, `${finalStem}.md`);
     const jsonExists = fs.existsSync(candidateJson);
-    const mdExists = config.writeMarkdown ? fs.existsSync(candidateMd) : false;
+    const mdExists = fs.existsSync(candidateMd);
     if (!jsonExists && !mdExists) {
       break;
     }
@@ -701,18 +843,16 @@ async function writeReport(payload, config) {
   const jsonPath = path.join(config.outputDir, `${finalStem}.json`);
   const mdPath = path.join(config.outputDir, `${finalStem}.md`);
 
-  await fsp.writeFile(jsonPath, JSON.stringify(payload, null, 2), "utf8");
   const screenshotFileMap = await exportScreenshotFiles(payload, config.outputDir, finalStem);
-
-  if (config.writeMarkdown) {
-    const markdown = buildMarkdown(reportId, payload, screenshotFileMap);
-    await fsp.writeFile(mdPath, markdown, "utf8");
-  }
+  const jsonReport = buildJsonReport(reportId, payload, screenshotFileMap);
+  await fsp.writeFile(jsonPath, JSON.stringify(jsonReport, null, 2), "utf8");
+  const markdown = buildMarkdown(reportId, payload, screenshotFileMap);
+  await fsp.writeFile(mdPath, markdown, "utf8");
 
   return {
     reportId,
     jsonPath,
-    markdownPath: config.writeMarkdown ? mdPath : null
+    markdownPath: mdPath
   };
 }
 

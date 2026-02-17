@@ -3,39 +3,18 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>UI Feedback Recorder</title>
+    <title>LLM Feedback</title>
     <link rel="stylesheet" href="popup.css" />
   </head>
   <body>
     <main>
-      <h1>UI Feedback Recorder</h1>
-      <p id="status" class="status">Sesja: brak</p>
+      <h1>LLM Feedback</h1>
+      <p id="domain" class="domain">Domena: -</p>
 
-      <section class="row">
-        <button id="newSessionBtn">Wyczyść</button>
-        <button id="markAreaBtn">Zaznacz obszar</button>
-      </section>
+      <button id="toggleBtn" class="toggle" type="button">...</button>
 
-      <section class="block">
-        <button id="pickElementBtn" class="full">Wybierz element</button>
-      </section>
-
-      <section class="block">
-        <label for="comment">Notatka do wybranego obszaru</label>
-        <textarea id="comment" rows="4" placeholder="Opisz co tu nie działa i jak odtworzyć problem"></textarea>
-        <button id="addAnnotationBtn">Dodaj notatkę</button>
-      </section>
-
-      <section class="row">
-        <button id="exportBtn">Wyślij do localhost</button>
-        <button id="jsonBtn">Export JSON</button>
-      </section>
-
-      <section class="meta">
-        <p id="selectedMeta">Wybrany obszar: brak</p>
-        <p id="countsMeta">Kroki: 0 | Obszary: 0 | Notatki: 0</p>
-        <p id="message" class="message"></p>
-      </section>
+      <p id="status" class="status"></p>
+      <p class="hint">Ustawienie jest zapamiętywane osobno dla każdej domeny.</p>
     </main>
 
     <script src="popup.js" type="module"></script>

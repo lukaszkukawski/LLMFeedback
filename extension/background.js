@@ -1,7 +1,20 @@
 const STORAGE_KEY = "uiFeedbackState";
 const CORRELATION_WINDOW_MS = 30_000;
+const MAX_TIMELINE_EVENTS = 80;
+const MAX_CLICK_EVENTS = 10;
+const MAX_PENDING_INPUT_EVENTS = 20;
+const INPUT_ERROR_LINK_WINDOW_MS = 15_000;
 const LOCAL_API_URL = "http://127.0.0.1:3030/analyze";
 const DEBUG_LOGS = true;
+const REPRO_BEFORE_WINDOW_MS = 20_000;
+const REPRO_AFTER_ERROR_MS = 10_000;
+const REPRO_MAX_USER_STEPS = 5;
+const ERROR_EVENT_TYPES = new Set([
+  "js.error",
+  "js.unhandledrejection",
+  "console.error",
+  "network.failure"
+]);
 
 const DEFAULT_STATE = {
   sessionActive: false,
@@ -15,6 +28,7 @@ const DEFAULT_STATE = {
   attachments: [],
   selectedRegion: null,
   lastUiEvent: null,
+  pendingInputEvents: [],
   queuedExports: []
 };
 
@@ -35,6 +49,7 @@ async function getState() {
     regions: Array.isArray(raw.regions) ? raw.regions : [],
     annotations: Array.isArray(raw.annotations) ? raw.annotations : [],
     attachments: Array.isArray(raw.attachments) ? raw.attachments : [],
+    pendingInputEvents: Array.isArray(raw.pendingInputEvents) ? raw.pendingInputEvents : [],
     queuedExports: Array.isArray(raw.queuedExports) ? raw.queuedExports : [],
     selectedRegion:
       raw.selectedRegion && typeof raw.selectedRegion === "object" ? raw.selectedRegion : null
@@ -127,8 +142,12 @@ function normalizeElement(element) {
 
   return {
     cssSelector: clip(element.cssSelector || "", 500),
+    stableSelector: clip(element.stableSelector || "", 500),
     xpath: clip(element.xpath || "", 1000),
     text: clip(element.text || "", textLimit),
+    textCompact: clip(element.textCompact || "", 200),
+    nearestLabelOrHeading: clip(element.nearestLabelOrHeading || "", 200),
+    compactHtmlSnippet: clip(element.compactHtmlSnippet || "", 600),
     outerHtmlSnippet: clip(element.outerHtmlSnippet || "", htmlLimit),
     cssSnapshot: clip(element.cssSnapshot || "", cssLimit),
     cssSources: Array.isArray(element.cssSources)
@@ -142,6 +161,7 @@ function normalizeElement(element) {
     captureMode,
     rect: element.rect || null,
     tagName: element.tagName || null,
+    role: element.role || null,
     inputType: element.inputType || null
   };
 }
@@ -162,6 +182,190 @@ function normalizeRegion(region) {
     scrollY: Number(region.scrollY || 0),
     viewportW: Number(region.viewportW || 0),
     viewportH: Number(region.viewportH || 0)
+  };
+}
+
+function parseTimestampMs(input) {
+  const parsed = Date.parse(String(input || ""));
+  return Number.isFinite(parsed) ? parsed : 0;
+}
+
+function toUrlPath(input) {
+  try {
+    const value = String(input || "");
+    if (!value) {
+      return "";
+    }
+    const parsed = new URL(value);
+    return `${parsed.pathname}${parsed.search}`;
+  } catch {
+    return String(input || "");
+  }
+}
+
+function compactCssSelector(input) {
+  const raw = String(input || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const collapsed = raw.replace(/\s+/g, " ");
+  const parts = collapsed.split(">").map((part) => part.trim()).filter(Boolean);
+  const tail = parts.length > 2 ? parts.slice(parts.length - 2) : parts;
+  return clip(tail.join(" > "), 180);
+}
+
+function compactXpath(input) {
+  const raw = String(input || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const parts = raw.split("/").filter(Boolean);
+  const tail = parts.length > 3 ? parts.slice(parts.length - 3) : parts;
+  return clip(`/${tail.join("/")}`, 180);
+}
+
+function getStableSelectorFromElement(element) {
+  if (!element || typeof element !== "object") {
+    return "";
+  }
+  return (
+    clip(String(element.stableSelector || ""), 2000) ||
+    clip(String(element.cssSelector || ""), 2000) ||
+    clip(String(element.xpath || ""), 3000) ||
+    compactCssSelector(element.cssSelector) ||
+    compactXpath(element.xpath) ||
+    clip(String(element.tagName || ""), 60)
+  );
+}
+
+function formatTrackerEventData(type, data) {
+  const payload = data && typeof data === "object" ? data : {};
+
+  if (type === "console.error") {
+    return String(payload.message || "console.error");
+  }
+  if (type === "js.error") {
+    return String(payload.message || "js.error");
+  }
+  if (type === "js.unhandledrejection") {
+    return String(payload.reason || "Unhandled rejection");
+  }
+  if (type === "network.failure") {
+    const method = String(payload.method || "GET");
+    const url = String(payload.url || "");
+    const status = payload.status != null ? String(payload.status) : "";
+    return [method, url, status].filter(Boolean).join(" ");
+  }
+  if (type === "ui.click") {
+    return `click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`;
+  }
+  if (type === "ui.input") {
+    const inputType = String(payload.inputType || "");
+    const value = clip(String(payload.value || ""), 80);
+    return `${inputType}${value ? ` value=${value}` : ""}`.trim();
+  }
+  if (type === "ui.scroll") {
+    return `scroll x=${Number(payload.scrollX || 0)} y=${Number(payload.scrollY || 0)}`;
+  }
+  if (type === "nav.change") {
+    return String(payload.url || payload.source || "nav.change");
+  }
+  return "";
+}
+
+function buildReproWindowFromTimeline(timeline, linkedEventId) {
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return [];
+  }
+
+  const USER_EVENT_TYPES = new Set(["ui.click", "ui.input", "nav.change"]);
+  const ERROR_EVENT_TYPES = new Set([
+    "console.error",
+    "network.failure",
+    "js.error",
+    "js.unhandledrejection"
+  ]);
+
+  const linkedEvent = timeline.find((event) => event.id === linkedEventId) || null;
+  const fallbackUserEvent = [...timeline].reverse().find((event) => USER_EVENT_TYPES.has(String(event?.type || ""))) || null;
+  const anchorEvent = linkedEvent || fallbackUserEvent;
+  const anchorTsMs = parseTimestampMs(anchorEvent?.ts);
+  if (!anchorEvent || !anchorTsMs) {
+    return [];
+  }
+
+  const userSteps = timeline
+    .filter((event) => {
+      const type = String(event?.type || "");
+      if (!USER_EVENT_TYPES.has(type)) {
+        return false;
+      }
+      const tsMs = parseTimestampMs(event?.ts);
+      if (!tsMs) {
+        return false;
+      }
+      return tsMs <= anchorTsMs && tsMs >= anchorTsMs - REPRO_BEFORE_WINDOW_MS;
+    })
+    .slice(-REPRO_MAX_USER_STEPS)
+    .map((event) => ({
+      ts: event.ts || "",
+      type: String(event.type || "unknown"),
+      url: event.url || "",
+      details: formatTrackerEventData(String(event.type || ""), event.data || {})
+    }));
+
+  const nearestError = timeline
+    .filter((event) => {
+      const type = String(event?.type || "");
+      if (!ERROR_EVENT_TYPES.has(type)) {
+        return false;
+      }
+      const tsMs = parseTimestampMs(event?.ts);
+      if (!tsMs) {
+        return false;
+      }
+      return tsMs >= anchorTsMs && tsMs <= anchorTsMs + REPRO_AFTER_ERROR_MS;
+    })
+    .sort((a, b) => parseTimestampMs(a.ts) - parseTimestampMs(b.ts))[0];
+
+  if (nearestError) {
+    userSteps.push({
+      ts: nearestError.ts || "",
+      type: String(nearestError.type || "unknown"),
+      url: nearestError.url || "",
+      details: formatTrackerEventData(String(nearestError.type || ""), nearestError.data || {})
+    });
+  }
+
+  return userSteps;
+}
+
+function buildAnnotationAutoContext(annotation, sessionUrl = "") {
+  const element = annotation?.element || null;
+  const selectionType = annotation?.selectionType === "element" ? "element" : "area";
+  const selectorStable = getStableSelectorFromElement(element) || "n/a";
+  const elementText = clip(
+    String(element?.textCompact || element?.text || "").replace(/\s+/g, " ").trim(),
+    500
+  );
+  const nearest = clip(
+    String(element?.nearestLabelOrHeading || "").replace(/\s+/g, " ").trim(),
+    400
+  );
+  const htmlSnippet = clip(
+    String(element?.compactHtmlSnippet || "").replace(/\s+/g, " ").trim(),
+    1400
+  );
+
+  return {
+    urlPath: toUrlPath(annotation?.url || sessionUrl || ""),
+    selectionType,
+    selectorStable,
+    elementText: elementText || "none",
+    nearestLabelOrHeading: nearest || "none",
+    tag: String(element?.tagName || "").toLowerCase() || "none",
+    role: clip(String(element?.role || "").trim(), 80) || "none",
+    htmlSnippetCompact: htmlSnippet || "none"
   };
 }
 
@@ -267,16 +471,165 @@ async function setOverlayVisibilityForCapture(tabId, visible) {
   }
 }
 
+async function captureGlobalViewportAttachment(state) {
+  if (!state || typeof state.windowId !== "number" || typeof state.tabId !== "number") {
+    return null;
+  }
+
+  let overlayHidden = false;
+  try {
+    await setOverlayVisibilityForCapture(state.tabId, false);
+    overlayHidden = true;
+    await new Promise((resolve) => setTimeout(resolve, 80));
+
+    const screenshotDataUrl = await chrome.tabs.captureVisibleTab(state.windowId, {
+      format: "png"
+    });
+    if (typeof screenshotDataUrl !== "string" || !screenshotDataUrl.startsWith("data:image/")) {
+      return null;
+    }
+
+    return {
+      id: makeId("shot_global"),
+      type: "image/png",
+      source: "page-overview",
+      ts: nowIso(),
+      dataUrl: screenshotDataUrl
+    };
+  } catch (error) {
+    debugLog("CAPTURE_GLOBAL_VIEWPORT:failed", {
+      tabId: state.tabId,
+      message: error?.message || String(error)
+    });
+    return null;
+  } finally {
+    if (overlayHidden) {
+      await setOverlayVisibilityForCapture(state.tabId, true);
+    }
+  }
+}
+
 function buildEvent(state, payload) {
   return {
     id: makeId("evt"),
     seq: state.nextSeq,
-    ts: nowIso(),
+    ts: payload.ts || nowIso(),
     type: payload.type,
     url: payload.url || state.session?.pageContext?.url || "",
     element: normalizeElement(payload.element),
     data: sanitizeValue(payload.data || {})
   };
+}
+
+function pushTimelineEvent(state, event) {
+  state.timeline.push(event);
+  state.nextSeq += 1;
+}
+
+function trimClickEvents(state) {
+  const clickIndexes = [];
+  for (let index = 0; index < state.timeline.length; index += 1) {
+    if (String(state.timeline[index]?.type || "") === "ui.click") {
+      clickIndexes.push(index);
+    }
+  }
+
+  const overflow = clickIndexes.length - MAX_CLICK_EVENTS;
+  if (overflow <= 0) {
+    return;
+  }
+
+  let removed = 0;
+  for (const index of clickIndexes) {
+    if (removed >= overflow) {
+      break;
+    }
+    state.timeline.splice(index - removed, 1);
+    removed += 1;
+  }
+}
+
+function trimNonErrorTimelineEvents(state) {
+  let nonErrorCount = 0;
+  for (const event of state.timeline) {
+    if (!ERROR_EVENT_TYPES.has(String(event?.type || ""))) {
+      nonErrorCount += 1;
+    }
+  }
+
+  let overflow = nonErrorCount - MAX_TIMELINE_EVENTS;
+  if (overflow <= 0) {
+    return;
+  }
+
+  const trimmed = [];
+  for (const event of state.timeline) {
+    const isError = ERROR_EVENT_TYPES.has(String(event?.type || ""));
+    if (!isError && overflow > 0) {
+      overflow -= 1;
+      continue;
+    }
+    trimmed.push(event);
+  }
+  state.timeline = trimmed;
+}
+
+function queuePendingInput(state, payload) {
+  const queued = {
+    ts: nowIso(),
+    url: payload.url || state.session?.pageContext?.url || "",
+    element: normalizeElement(payload.element),
+    data: sanitizeValue(payload.data || {})
+  };
+  const tsMs = parseTimestampMs(queued.ts) || Date.now();
+  state.pendingInputEvents.push({ tsMs, payload: queued });
+  if (state.pendingInputEvents.length > MAX_PENDING_INPUT_EVENTS) {
+    state.pendingInputEvents = state.pendingInputEvents.slice(
+      state.pendingInputEvents.length - MAX_PENDING_INPUT_EVENTS
+    );
+  }
+}
+
+function flushInputForError(state, errorTsMs) {
+  if (!Array.isArray(state.pendingInputEvents) || state.pendingInputEvents.length === 0) {
+    return null;
+  }
+
+  const candidates = state.pendingInputEvents.filter((item) => {
+    if (!item || !item.payload) {
+      return false;
+    }
+    if (!Number.isFinite(item.tsMs)) {
+      return false;
+    }
+    return item.tsMs <= errorTsMs && errorTsMs - item.tsMs <= INPUT_ERROR_LINK_WINDOW_MS;
+  });
+
+  let insertedInputEvent = null;
+  if (candidates.length > 0) {
+    const latest = candidates[candidates.length - 1];
+    const inputEvent = buildEvent(state, {
+      type: "ui.input",
+      url: latest.payload.url,
+      element: latest.payload.element,
+      data: latest.payload.data,
+      ts: latest.payload.ts
+    });
+    pushTimelineEvent(state, inputEvent);
+    insertedInputEvent = inputEvent;
+  }
+
+  state.pendingInputEvents = state.pendingInputEvents.filter((item) => {
+    if (!item || !Number.isFinite(item.tsMs)) {
+      return false;
+    }
+    if (item.tsMs <= errorTsMs) {
+      return false;
+    }
+    return true;
+  });
+
+  return insertedInputEvent;
 }
 
 async function appendTimelineEvent(payload) {
@@ -285,30 +638,47 @@ async function appendTimelineEvent(payload) {
       return { ignored: true };
     }
 
+    const type = String(payload.type || "");
+    const nowMs = Date.now();
+    state.pendingInputEvents = state.pendingInputEvents.filter((item) => {
+      if (!item || !Number.isFinite(item.tsMs)) {
+        return false;
+      }
+      return nowMs - item.tsMs <= INPUT_ERROR_LINK_WINDOW_MS;
+    });
+
+    if (type === "ui.input") {
+      queuePendingInput(state, payload);
+      return { queuedInput: true };
+    }
+
     const event = buildEvent(state, payload);
+    const eventTsMs = parseTimestampMs(event.ts) || nowMs;
+    const isUiEvent = type.startsWith("ui.") || type === "nav.change";
+    const isErrorEvent = ERROR_EVENT_TYPES.has(type);
 
-    const isUiEvent = payload.type.startsWith("ui.") || payload.type === "nav.change";
-    const isErrorEvent = [
-      "js.error",
-      "js.unhandledrejection",
-      "console.error",
-      "network.failure"
-    ].includes(payload.type);
-
-    if (isErrorEvent && state.lastUiEvent) {
-      const diffMs = Date.now() - state.lastUiEvent.epochMs;
-      if (diffMs <= CORRELATION_WINDOW_MS) {
-        event.causedByEventId = state.lastUiEvent.id;
+    let linkedInputEvent = null;
+    if (isErrorEvent) {
+      linkedInputEvent = flushInputForError(state, eventTsMs);
+      if (linkedInputEvent) {
+        event.causedByEventId = linkedInputEvent.id;
+      }
+      if (!event.causedByEventId && state.lastUiEvent) {
+        const diffMs = eventTsMs - state.lastUiEvent.epochMs;
+        if (diffMs >= 0 && diffMs <= CORRELATION_WINDOW_MS) {
+          event.causedByEventId = state.lastUiEvent.id;
+        }
       }
     }
 
-    state.timeline.push(event);
-    state.nextSeq += 1;
+    pushTimelineEvent(state, event);
+    trimClickEvents(state);
+    trimNonErrorTimelineEvents(state);
 
     if (isUiEvent) {
       state.lastUiEvent = {
         id: event.id,
-        epochMs: Date.now()
+        epochMs: eventTsMs
       };
     }
 
@@ -369,6 +739,7 @@ async function initSession(tab, reset = false) {
       state.attachments = [];
       state.selectedRegion = null;
       state.lastUiEvent = null;
+      state.pendingInputEvents = [];
       state.session = createEmptySession(tab);
     } else {
       state.session.pageContext = {
@@ -469,43 +840,17 @@ async function addAnnotation({ comment, tabId }) {
       comment: sanitizeValue(text),
       regionId: state.selectedRegion.id,
       region: state.selectedRegion.region,
+      selectionType: state.selectedRegion.selectionType === "element" ? "element" : "area",
       element: normalizeElement(state.selectedRegion.element),
       linkedEventId: state.lastUiEvent?.id || null,
       screenshotId: null
     };
+    annotation.reproWindow = buildReproWindowFromTimeline(state.timeline, annotation.linkedEventId);
+    annotation.autoContext = buildAnnotationAutoContext(annotation, state.session.pageContext.url);
 
     state.annotations.push(annotation);
     state.selectedRegion = null;
 
-    return { ok: true, annotation };
-  });
-}
-
-async function addGeneralInfo({ tabId, comment, url }) {
-  return mutateState((state) => {
-    if (!state.session || !state.sessionActive || tabId !== state.tabId) {
-      return { ok: false, error: "Brak aktywnej sesji dla tej karty." };
-    }
-
-    const text = (comment || "").trim();
-    if (!text) {
-      return { ok: false, error: "Notatka jest wymagana." };
-    }
-
-    const annotation = {
-      id: makeId("ann"),
-      ts: nowIso(),
-      url: url || state.session.pageContext.url,
-      comment: sanitizeValue(text),
-      scope: "general",
-      regionId: null,
-      region: null,
-      element: null,
-      linkedEventId: state.lastUiEvent?.id || null,
-      screenshotId: null
-    };
-
-    state.annotations.push(annotation);
     return { ok: true, annotation };
   });
 }
@@ -772,7 +1117,7 @@ async function addAnnotationForRegion({
     let screenshotId = null;
     const resolvedSelectionType =
       region.selectionType === "element" || selectionType === "element" ? "element" : "area";
-    if (resolvedSelectionType === "area" && typeof state.windowId === "number") {
+    if (region.region && typeof state.windowId === "number") {
       let overlayHidden = false;
       try {
         await setOverlayVisibilityForCapture(state.tabId, false);
@@ -788,7 +1133,7 @@ async function addAnnotationForRegion({
           state.attachments.push({
             id: screenshotId,
             type: "image/png",
-            source: "region-crop",
+            source: resolvedSelectionType === "element" ? "element-crop" : "region-crop",
             ts: nowIso(),
             dataUrl: croppedDataUrl
           });
@@ -817,6 +1162,8 @@ async function addAnnotationForRegion({
       linkedEventId: state.lastUiEvent?.id || null,
       screenshotId
     };
+    annotation.reproWindow = buildReproWindowFromTimeline(state.timeline, annotation.linkedEventId);
+    annotation.autoContext = buildAnnotationAutoContext(annotation, state.session.pageContext.url);
 
     state.annotations.push(annotation);
     state.selectedRegion = region;
@@ -967,6 +1314,11 @@ async function exportToBackend(fileName = "") {
   }
 
   const payload = buildPayload(state, { fileName });
+  const globalAttachment = await captureGlobalViewportAttachment(state);
+  if (globalAttachment) {
+    payload.attachments = [...(payload.attachments || []), globalAttachment];
+    payload.globalScreenshotId = globalAttachment.id;
+  }
 
   try {
     const response = await fetch(LOCAL_API_URL, {
@@ -999,29 +1351,6 @@ async function exportToBackend(fileName = "") {
       queuedId: queued.id
     };
   }
-}
-
-async function exportSessionJsonDownload() {
-  const state = await getState();
-  if (!state.session) {
-    return { ok: false, error: "Brak sesji do eksportu." };
-  }
-
-  const payload = buildPayload(state);
-  const blob = new Blob([JSON.stringify(payload, null, 2)], {
-    type: "application/json"
-  });
-  const url = URL.createObjectURL(blob);
-
-  const fileName = `ui-feedback-${Date.now()}.json`;
-  await chrome.downloads.download({
-    url,
-    filename: fileName,
-    saveAs: true
-  });
-
-  setTimeout(() => URL.revokeObjectURL(url), 3_000);
-  return { ok: true, fileName };
 }
 
 chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
@@ -1104,16 +1433,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
           return;
         }
 
-        case "ADD_GENERAL_INFO": {
-          const result = await addGeneralInfo({
-            tabId: sender.tab?.id || message.tabId,
-            comment: message.comment,
-            url: message.url || sender.tab?.url || ""
-          });
-          sendResponse(result);
-          return;
-        }
-
         case "ATTACH_REGION_CSS": {
           const result = await attachRegionCss({
             tabId: sender.tab?.id || message.tabId,
@@ -1187,12 +1506,6 @@ chrome.runtime.onMessage.addListener((message, sender, sendResponse) => {
 
         case "EXPORT_TO_BACKEND": {
           const result = await exportToBackend(message.fileName || "");
-          sendResponse(result);
-          return;
-        }
-
-        case "EXPORT_JSON_FILE": {
-          const result = await exportSessionJsonDownload();
           sendResponse(result);
           return;
         }

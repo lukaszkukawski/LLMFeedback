@@ -16,9 +16,6 @@
   let floatingStatus = null;
   let floatingScrollButton = null;
   let floatingScrollKnob = null;
-  let floatingErrorButton = null;
-  let floatingErrorLabel = null;
-  let floatingErrorPulse = null;
   let floatingFilePath = null;
   let floatingMarkAreaBtn = null;
   let floatingPickElementBtn = null;
@@ -26,7 +23,6 @@
   let panelVisible = false;
   let floatingCorner = "bottom-right";
   let scrollTimer = null;
-  let errorRecordingEnabled = false;
   let scrollLockActive = false;
   const scrollLockReasons = new Set();
   let lockedScrollX = 0;
@@ -38,14 +34,47 @@
   let prevHtmlUserSelect = "";
   let prevBodyUserSelect = "";
   let overlaysHiddenForScreenshot = false;
+  let domainEnabled = true;
   const regionVisuals = new Map();
   const DEBUG_LOGS = false;
+  const DOMAIN_SETTINGS_KEY = "uiFeedbackDomainSettings";
+  const DOMAIN_PROTOCOLS = new Set(["http:", "https:"]);
 
   function debugLog(...args) {
     if (!DEBUG_LOGS) {
       return;
     }
     console.log("[ui-feedback/content]", ...args);
+  }
+
+  function getCurrentDomainKey() {
+    return String(location.hostname || "").toLowerCase();
+  }
+
+  function isDomainToggleSupported() {
+    return DOMAIN_PROTOCOLS.has(String(location.protocol || "").toLowerCase());
+  }
+
+  async function readDomainEnabledFromStorage() {
+    if (!isDomainToggleSupported()) {
+      return true;
+    }
+
+    const domain = getCurrentDomainKey();
+    if (!domain) {
+      return true;
+    }
+
+    try {
+      const result = await chrome.storage.local.get(DOMAIN_SETTINGS_KEY);
+      const map = result?.[DOMAIN_SETTINGS_KEY];
+      if (!map || typeof map !== "object") {
+        return true;
+      }
+      return map[domain] !== false;
+    } catch {
+      return true;
+    }
   }
 
   async function copyTextToClipboard(text) {
@@ -80,7 +109,6 @@
 
   function handleExtensionContextInvalidated() {
     sessionActive = false;
-    errorRecordingEnabled = false;
     regionMode = false;
     elementMode = false;
     drawing = false;
@@ -93,7 +121,6 @@
     setScrollLockReason("region", false);
     setScrollLockReason("element", false);
     updateModeButtons();
-    updateErrorRecordingButton();
     if (floatingStatus) {
       floatingStatus.textContent =
         "Rozszerzenie zostało przeładowane. Odśwież stronę (Cmd/Ctrl+R), aby kontynuować.";
@@ -169,6 +196,74 @@
     setUiOverlayVisibility(true);
   }
 
+  function hideFloatingUi() {
+    panelVisible = false;
+    setScrollLockReason("panel", false);
+    if (floatingPanel) {
+      floatingPanel.style.display = "none";
+    }
+    if (floatingLauncher) {
+      floatingLauncher.style.display = "none";
+    }
+  }
+
+  function showFloatingUi() {
+    ensureFloatingControls();
+    if (floatingLauncher) {
+      floatingLauncher.style.display = "flex";
+    }
+    if (floatingPanel) {
+      floatingPanel.style.display = panelVisible ? "block" : "none";
+    }
+  }
+
+  function applyDomainEnabledState(enabled) {
+    domainEnabled = !!enabled;
+
+    if (domainEnabled) {
+      showUiOverlaysAfterScreenshot();
+      showFloatingUi();
+      return;
+    }
+
+    stopRegionMode();
+    stopElementMode();
+    clearAllRegionVisuals();
+    showUiOverlaysAfterScreenshot();
+    hideFloatingUi();
+  }
+
+  async function initializeDomainEnabledState() {
+    const enabled = await readDomainEnabledFromStorage();
+    applyDomainEnabledState(enabled);
+  }
+
+  function resolveDomainEnabledFromSettingsMap(map) {
+    if (!isDomainToggleSupported()) {
+      return true;
+    }
+    const domain = getCurrentDomainKey();
+    if (!domain) {
+      return true;
+    }
+    if (!map || typeof map !== "object") {
+      return true;
+    }
+    return map[domain] !== false;
+  }
+
+  function onStorageChanged(changes, areaName) {
+    if (areaName !== "local") {
+      return;
+    }
+    if (!Object.prototype.hasOwnProperty.call(changes, DOMAIN_SETTINGS_KEY)) {
+      return;
+    }
+    const nextMap = changes[DOMAIN_SETTINGS_KEY]?.newValue;
+    const enabled = resolveDomainEnabledFromSettingsMap(nextMap);
+    applyDomainEnabledState(enabled);
+  }
+
   function setScrollLockReason(reason, enabled) {
     if (enabled) {
       scrollLockReasons.add(reason);
@@ -187,25 +282,6 @@
         floatingScrollKnob.style.left = panelScrollBlockEnabled ? "13px" : "1px";
       }
     }
-  }
-
-  function updateErrorRecordingButton() {
-    if (!floatingErrorButton) {
-      return;
-    }
-    if (floatingErrorLabel) {
-      floatingErrorLabel.textContent = errorRecordingEnabled
-        ? "Nagrywanie zdarzeń i logów"
-        : "Rejestruj zdarzenia i logi konsoli";
-    }
-    if (floatingErrorPulse) {
-      floatingErrorPulse.style.display = errorRecordingEnabled ? "inline-flex" : "none";
-    }
-    floatingErrorButton.style.background = errorRecordingEnabled ? "rgba(239, 68, 68, 0.22)" : "rgba(239, 68, 68, 0.08)";
-    floatingErrorButton.style.color = errorRecordingEnabled ? "#fca5a5" : "#f87171";
-    floatingErrorButton.style.border = errorRecordingEnabled
-      ? "1px solid rgba(239, 68, 68, 0.45)"
-      : "1px solid rgba(239, 68, 68, 0.25)";
   }
 
   function applyModeButtonStyle(button, active, activeType = "primary") {
@@ -544,7 +620,7 @@
 
     const row2 = document.createElement("div");
     row2.style.display = "grid";
-    row2.style.gridTemplateColumns = "1fr 0.95fr 1.35fr";
+    row2.style.gridTemplateColumns = "0.95fr 1.35fr";
     row2.style.gap = "8px";
 
     const row3 = document.createElement("div");
@@ -644,39 +720,6 @@
     floatingMarkAreaBtn = markAreaBtn;
     floatingPickElementBtn = pickElementBtn;
 
-    const generalInfoField = document.createElement("div");
-    generalInfoField.dataset.uiFeedbackControl = "1";
-    generalInfoField.style.display = "grid";
-    generalInfoField.style.gap = "6px";
-    generalInfoField.style.background = "rgba(255, 255, 255, 0.05)";
-    generalInfoField.style.border = "1px solid rgba(255, 255, 255, 0.1)";
-    generalInfoField.style.borderRadius = "10px";
-    generalInfoField.style.padding = "8px";
-
-    const generalInfoLabel = document.createElement("label");
-    generalInfoLabel.dataset.uiFeedbackControl = "1";
-    generalInfoLabel.textContent = "Info ogólne (dodane przy zapisie)";
-    generalInfoLabel.style.fontSize = "9px";
-    generalInfoLabel.style.textTransform = "uppercase";
-    generalInfoLabel.style.letterSpacing = "0.06em";
-    generalInfoLabel.style.fontWeight = "700";
-    generalInfoLabel.style.color = "#94a3b8";
-
-    const generalInfoInput = document.createElement("textarea");
-    generalInfoInput.rows = 2;
-    generalInfoInput.placeholder = "Np. kontekst, oczekiwane zachowanie, priorytet...";
-    generalInfoInput.dataset.uiFeedbackControl = "1";
-    generalInfoInput.style.width = "100%";
-    generalInfoInput.style.resize = "vertical";
-    generalInfoInput.style.boxSizing = "border-box";
-    generalInfoInput.style.border = "1px solid rgba(255, 255, 255, 0.1)";
-    generalInfoInput.style.background = "rgba(0, 0, 0, 0.2)";
-    generalInfoInput.style.color = "#f8fafc";
-    generalInfoInput.style.borderRadius = "8px";
-    generalInfoInput.style.padding = "7px 8px";
-    generalInfoInput.style.fontSize = "11px";
-    generalInfoInput.style.outline = "none";
-
     floatingScrollButton = document.createElement("button");
     floatingScrollButton.type = "button";
     floatingScrollButton.textContent = "";
@@ -704,62 +747,6 @@
     floatingScrollKnob.style.transition = "left 140ms ease";
     floatingScrollKnob.style.pointerEvents = "none";
     floatingScrollButton.appendChild(floatingScrollKnob);
-
-    floatingErrorButton = document.createElement("button");
-    floatingErrorButton.type = "button";
-    floatingErrorButton.title = "Włącz śledzenie zdarzeń i logów konsoli";
-    floatingErrorButton.dataset.uiFeedbackControl = "1";
-    floatingErrorButton.style.border = "1px solid rgba(239, 68, 68, 0.25)";
-    floatingErrorButton.style.background = "rgba(239, 68, 68, 0.08)";
-    floatingErrorButton.style.color = "#f87171";
-    floatingErrorButton.style.borderRadius = "10px";
-    floatingErrorButton.style.padding = "8px 6px";
-    floatingErrorButton.style.cursor = "pointer";
-    floatingErrorButton.style.fontSize = "10px";
-    floatingErrorButton.style.fontWeight = "700";
-    floatingErrorButton.style.lineHeight = "1.25";
-    floatingErrorButton.style.display = "grid";
-    floatingErrorButton.style.gridTemplateRows = "auto auto";
-    floatingErrorButton.style.justifyItems = "center";
-    floatingErrorButton.style.alignContent = "center";
-    floatingErrorButton.style.gap = "3px";
-    floatingErrorButton.style.textAlign = "center";
-    floatingErrorButton.style.minHeight = "56px";
-
-    const errorIcon = makeIcon(
-      '<path d="M4 12H8L10.2 7L13.5 16L16 11H20" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>',
-      14
-    );
-    errorIcon.style.position = "relative";
-    errorIcon.style.display = "inline-flex";
-    errorIcon.style.alignItems = "center";
-    errorIcon.style.justifyContent = "center";
-    errorIcon.style.width = "18px";
-    errorIcon.style.height = "18px";
-
-    floatingErrorPulse = document.createElement("span");
-    floatingErrorPulse.dataset.uiFeedbackControl = "1";
-    floatingErrorPulse.style.position = "absolute";
-    floatingErrorPulse.style.width = "8px";
-    floatingErrorPulse.style.height = "8px";
-    floatingErrorPulse.style.right = "-1px";
-    floatingErrorPulse.style.top = "-1px";
-    floatingErrorPulse.style.borderRadius = "9999px";
-    floatingErrorPulse.style.background = "#ef4444";
-    floatingErrorPulse.style.boxShadow = "0 0 0 0 rgba(239, 68, 68, 0.55)";
-    floatingErrorPulse.style.animation = "uiFeedbackRecPulse 1.15s ease-out infinite";
-    floatingErrorPulse.style.display = "none";
-
-    floatingErrorLabel = document.createElement("span");
-    floatingErrorLabel.dataset.uiFeedbackControl = "1";
-    floatingErrorLabel.textContent = "Rejestruj zdarzenia i logi konsoli";
-    floatingErrorLabel.style.fontSize = "9px";
-    floatingErrorLabel.style.lineHeight = "1.15";
-    floatingErrorLabel.style.pointerEvents = "none";
-    floatingErrorLabel.style.whiteSpace = "normal";
-    errorIcon.appendChild(floatingErrorPulse);
-    floatingErrorButton.appendChild(errorIcon);
-    floatingErrorButton.appendChild(floatingErrorLabel);
 
     const lockGroup = document.createElement("div");
     lockGroup.dataset.uiFeedbackControl = "1";
@@ -1008,18 +995,14 @@
       return name.replace(extensionPattern, "");
     };
 
-    const isRequestedStemUsed = (requestedStem, jsonPath, mdPath) => {
+    const isRequestedStemUsed = (requestedStem, mdPath) => {
       if (!requestedStem) {
         return true;
       }
 
-      const jsonStem = getStemFromPath(jsonPath, /\.json$/i);
       const mdStem = getStemFromPath(mdPath, /\.md$/i);
       const allowed = (stem) => stem === requestedStem || stem.startsWith(`${requestedStem}-`);
 
-      if (jsonStem) {
-        return allowed(jsonStem);
-      }
       if (mdStem) {
         return allowed(mdStem);
       }
@@ -1082,19 +1065,20 @@
       return rowEl;
     };
 
-    const renderSavedPaths = (jsonPath, mdPath) => {
+    const renderSavedPaths = (mdPath) => {
       if (!floatingFilePath) {
         return;
       }
-      floatingFilePath.replaceChildren(
-        renderFilePathRow("JSON", jsonPath),
-        renderFilePathRow("MD", mdPath)
-      );
+      floatingFilePath.replaceChildren(renderFilePathRow("MD", mdPath));
     };
 
-    renderSavedPaths("", "");
+    renderSavedPaths("");
 
     const startRegionModeFromPanel = () => {
+      if (!domainEnabled) {
+        setFloatingStatus("Rozszerzenie wyłączone dla tej domeny.", true);
+        return;
+      }
       if (!sessionActive) {
         setFloatingStatus("Tworzenie sesji...", false);
       }
@@ -1126,6 +1110,10 @@
     };
 
     const startElementModeFromPanel = () => {
+      if (!domainEnabled) {
+        setFloatingStatus("Rozszerzenie wyłączone dla tej domeny.", true);
+        return;
+      }
       if (!sessionActive) {
         setFloatingStatus("Tworzenie sesji...", false);
       }
@@ -1177,8 +1165,6 @@
           sessionActive = true;
           stopRegionMode();
           stopElementMode();
-          errorRecordingEnabled = false;
-          updateErrorRecordingButton();
           clearAllRegionVisuals();
           setFloatingStatus(successMessage || "Wyczyszczono sesję.");
         }
@@ -1234,43 +1220,6 @@
       true
     );
 
-    floatingErrorButton.addEventListener(
-      "click",
-      (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-
-        if (errorRecordingEnabled) {
-          errorRecordingEnabled = false;
-          updateErrorRecordingButton();
-          setFloatingStatus("Rejestrowanie zdarzeń i logów konsoli wyłączone.");
-          return;
-        }
-
-        if (!sessionActive) {
-          setFloatingStatus("Tworzenie sesji...", false);
-        }
-
-        safeSendMessage(
-          { type: "INIT_SESSION_FROM_CONTENT", reset: false },
-          (response) => {
-            if (chrome.runtime.lastError || !response?.ok) {
-              setFloatingStatus(
-                response?.error || chrome.runtime.lastError?.message || "Błąd sesji.",
-                true
-              );
-              return;
-            }
-            sessionActive = true;
-            errorRecordingEnabled = true;
-            updateErrorRecordingButton();
-            setFloatingStatus("Rejestrowanie zdarzeń i logów konsoli włączone. Odtwórz kroki do problemu.");
-          }
-        );
-      },
-      true
-    );
-
     const exportToBackend = (fileName) => {
       setFloatingStatus("Zapisywanie pliku...", false);
       safeSendMessage(
@@ -1288,12 +1237,11 @@
           }
 
           const result = response.result || {};
-          const jsonPath = result.jsonPath || "";
           const mdPath = result.markdownPath || "";
-          renderSavedPaths(jsonPath, mdPath);
+          renderSavedPaths(mdPath);
 
           const requestedStem = sanitizeFileStem(fileName);
-          if (!isRequestedStemUsed(requestedStem, jsonPath, mdPath)) {
+          if (!isRequestedStemUsed(requestedStem, mdPath)) {
             resetSessionFromPanel({
               successMessage:
                 "Zapisano raport, ale backend nie użył podanej nazwy. Rozpoczęto nową czystą sesję.",
@@ -1312,70 +1260,11 @@
       );
     };
 
-    const appendGeneralInfoIfNeeded = (done) => {
-      const comment = generalInfoInput.value.trim();
-      if (!comment) {
-        done(true);
-        return;
-      }
-
-      const submit = () => {
-        safeSendMessage(
-          {
-            type: "ADD_GENERAL_INFO",
-            comment,
-            url: location.href
-          },
-          (response) => {
-            if (chrome.runtime.lastError || !response?.ok) {
-              setFloatingStatus(
-                response?.error || chrome.runtime.lastError?.message || "Błąd zapisu informacji.",
-                true
-              );
-              done(false);
-              return;
-            }
-
-            generalInfoInput.value = "";
-            sendEvent("ui.general.info.add", { commentLength: comment.length });
-            done(true);
-          }
-        );
-      };
-
-      if (sessionActive) {
-        submit();
-        return;
-      }
-
-      setFloatingStatus("Tworzenie sesji...", false);
-      safeSendMessage(
-        { type: "INIT_SESSION_FROM_CONTENT", reset: false },
-        (response) => {
-          if (chrome.runtime.lastError || !response?.ok) {
-            setFloatingStatus(
-              response?.error || chrome.runtime.lastError?.message || "Błąd sesji.",
-              true
-            );
-            done(false);
-            return;
-          }
-          sessionActive = true;
-          submit();
-        }
-      );
-    };
-
     const saveFile = (event) => {
       event.preventDefault();
       event.stopPropagation();
       const fileName = fileNameInput.value.trim();
-      appendGeneralInfoIfNeeded((ok) => {
-        if (!ok) {
-          return;
-        }
-        exportToBackend(fileName);
-      });
+      exportToBackend(fileName);
     };
 
     saveFileBtn.addEventListener("click", saveFile, true);
@@ -1387,17 +1276,13 @@
 
     row.appendChild(markAreaBtn);
     row.appendChild(pickElementBtn);
-    row2.appendChild(floatingErrorButton);
     row2.appendChild(cornerField);
     row2.appendChild(fileNameField);
     row3.appendChild(saveFileBtn);
     row3.appendChild(clearBtn);
-    generalInfoField.appendChild(generalInfoLabel);
-    generalInfoField.appendChild(generalInfoInput);
     panelBody.appendChild(row);
 
     panelBody.appendChild(row2);
-    panelBody.appendChild(generalInfoField);
     panelBody.appendChild(row3);
     panelBody.appendChild(floatingFilePath);
     floatingPanel.appendChild(header);
@@ -1422,7 +1307,6 @@
     updateModeButtons();
     updateCornerButtons();
     updatePanelScrollLock();
-    updateErrorRecordingButton();
   }
 
   function cssEscape(value) {
@@ -1430,6 +1314,116 @@
       return CSS.escape(value);
     }
     return String(value).replace(/([#.;?+*~':"!^$\[\]()=>|/@])/g, "\\$1");
+  }
+
+  function sanitizeText(value, maxLen) {
+    const clean = String(value || "").replace(/\s+/g, " ").trim();
+    return clip(clean, maxLen);
+  }
+
+  function getStableSelector(el) {
+    if (!(el instanceof Element)) {
+      return "";
+    }
+
+    const tag = el.tagName.toLowerCase();
+    if (el.id) {
+      return `#${cssEscape(el.id)}`;
+    }
+
+    const stableAttrs = ["data-testid", "data-test", "name"];
+    for (const attr of stableAttrs) {
+      const value = el.getAttribute(attr);
+      if (value && value.trim()) {
+        return `${tag}[${attr}="${cssEscape(value.trim())}"]`;
+      }
+    }
+
+    const ariaLabel = el.getAttribute("aria-label");
+    if (ariaLabel && ariaLabel.trim()) {
+      return `${tag}[aria-label="${cssEscape(ariaLabel.trim())}"]`;
+    }
+
+    return getCssSelector(el);
+  }
+
+  function getNearestLabelOrHeading(el) {
+    if (!(el instanceof Element)) {
+      return "none";
+    }
+
+    const ownAriaLabel = el.getAttribute("aria-label");
+    if (ownAriaLabel && ownAriaLabel.trim()) {
+      return sanitizeText(ownAriaLabel, 120);
+    }
+
+    const ownPlaceholder = el.getAttribute("placeholder");
+    if (ownPlaceholder && ownPlaceholder.trim()) {
+      return sanitizeText(ownPlaceholder, 120);
+    }
+
+    const id = el.getAttribute("id");
+    if (id) {
+      try {
+        const linkedLabel = document.querySelector(`label[for="${cssEscape(id)}"]`);
+        if (linkedLabel) {
+          const value = sanitizeText(linkedLabel.textContent || "", 120);
+          if (value) {
+            return value;
+          }
+        }
+      } catch {
+        // Ignore invalid selectors for malformed ids.
+      }
+    }
+
+    const wrappedLabel = el.closest("label");
+    if (wrappedLabel) {
+      const value = sanitizeText(wrappedLabel.textContent || "", 120);
+      if (value) {
+        return value;
+      }
+    }
+
+    let current = el;
+    while (current) {
+      const legend = current.querySelector(":scope > legend");
+      if (legend) {
+        const value = sanitizeText(legend.textContent || "", 120);
+        if (value) {
+          return value;
+        }
+      }
+      const heading = current.querySelector(":scope > h1, :scope > h2, :scope > h3, :scope > h4, :scope > h5, :scope > h6");
+      if (heading) {
+        const value = sanitizeText(heading.textContent || "", 120);
+        if (value) {
+          return value;
+        }
+      }
+      current = current.parentElement;
+    }
+
+    return "none";
+  }
+
+  function getElementRole(el) {
+    if (!(el instanceof Element)) {
+      return "none";
+    }
+    const explicit = sanitizeText(el.getAttribute("role") || "", 60);
+    if (explicit) {
+      return explicit;
+    }
+    return "none";
+  }
+
+  function getCompactHtmlSnippet(el) {
+    if (!(el instanceof Element)) {
+      return "";
+    }
+    const compact = String(el.outerHTML || "").replace(/\s+/g, " ").trim();
+    return clip(compact, 320);
   }
 
   function getCssSelector(el) {
@@ -1519,8 +1513,12 @@
     const rect = el.getBoundingClientRect();
     return {
       cssSelector: getCssSelector(el),
+      stableSelector: getStableSelector(el),
       xpath: getXPath(el),
-      text: clip((el.textContent || "").trim(), maxTextChars),
+      text: sanitizeText(el.textContent || "", maxTextChars),
+      textCompact: sanitizeText(el.textContent || "", 160),
+      nearestLabelOrHeading: getNearestLabelOrHeading(el),
+      compactHtmlSnippet: getCompactHtmlSnippet(el),
       outerHtmlSnippet: includeOuterHtml ? clip(el.outerHTML || "", maxOuterHtmlChars) : "",
       captureMode,
       rect: {
@@ -1530,6 +1528,7 @@
         height: Math.round(rect.height)
       },
       tagName: el.tagName,
+      role: getElementRole(el),
       inputType: el instanceof HTMLInputElement ? el.type || "text" : null
     };
   }
@@ -1555,16 +1554,14 @@
     "ui.region.select",
     "ui.element.select",
     "ui.region.note.add",
-    "ui.general.info.add",
     "ui.region.css.attach",
     "ui.region.html.attach",
     "ui.region.remove"
   ]);
 
-  const ERROR_RECORDING_EVENT_TYPES = new Set([
+  const AUTO_RECORDED_EVENT_TYPES = new Set([
     "ui.click",
     "ui.input",
-    "ui.scroll",
     "nav.change",
     "console.error",
     "network.failure",
@@ -1576,13 +1573,13 @@
     if (ALWAYS_RECORDED_EVENT_TYPES.has(type)) {
       return true;
     }
-    if (!errorRecordingEnabled) {
-      return false;
-    }
-    return ERROR_RECORDING_EVENT_TYPES.has(type);
+    return AUTO_RECORDED_EVENT_TYPES.has(type);
   }
 
   function sendEvent(type, data = {}, element = null) {
+    if (!domainEnabled) {
+      return;
+    }
     if (!sessionActive) {
       return;
     }
@@ -2402,73 +2399,80 @@
       '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M5 6.5C5 5.12 6.12 4 7.5 4H16.5C17.88 4 19 5.12 19 6.5V13.5C19 14.88 17.88 16 16.5 16H11L7 19V16H7.5C6.12 16 5 14.88 5 13.5V6.5Z" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/><path d="M12 7.8V12.2M9.8 10H14.2" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg>';
     noteButton.appendChild(noteIcon);
 
-    const cssButton = document.createElement("button");
-    cssButton.type = "button";
-    cssButton.title = "Załącz CSS elementu do raportu";
-    cssButton.dataset.uiFeedbackRegionId = regionId;
-    cssButton.dataset.uiFeedbackControl = "1";
-    cssButton.style.position = "fixed";
-    cssButton.style.left = "0";
-    cssButton.style.top = "0";
-    cssButton.style.width = "24px";
-    cssButton.style.height = "24px";
-    cssButton.style.border = "1px solid rgba(255, 255, 255, 0.1)";
-    cssButton.style.borderRadius = "7px";
-    cssButton.style.background = "#121a23";
-    cssButton.style.color = "#ffffff";
-    cssButton.style.fontSize = "12px";
-    cssButton.style.lineHeight = "12px";
-    cssButton.style.cursor = "pointer";
-    cssButton.style.zIndex = "2147483647";
-    cssButton.style.padding = "0";
-    cssButton.style.boxShadow = "0 6px 14px rgba(0,0,0,0.35)";
-    cssButton.style.display = "flex";
-    cssButton.style.alignItems = "center";
-    cssButton.style.justifyContent = "center";
+    const isElementSelection =
+      regionItem.selectionType === "element" || options.badgeKind === "element";
+    let cssButton = null;
+    let htmlButton = null;
 
-    const cssIcon = document.createElement("span");
-    cssIcon.dataset.uiFeedbackControl = "1";
-    cssIcon.style.display = "inline-flex";
-    cssIcon.style.width = "14px";
-    cssIcon.style.height = "14px";
-    cssIcon.style.pointerEvents = "none";
-    cssIcon.innerHTML =
-      '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9 3L4 12L9 21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 3L20 12L15 21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
-    cssButton.appendChild(cssIcon);
+    if (isElementSelection) {
+      cssButton = document.createElement("button");
+      cssButton.type = "button";
+      cssButton.title = "Załącz CSS elementu do raportu";
+      cssButton.dataset.uiFeedbackRegionId = regionId;
+      cssButton.dataset.uiFeedbackControl = "1";
+      cssButton.style.position = "fixed";
+      cssButton.style.left = "0";
+      cssButton.style.top = "0";
+      cssButton.style.width = "24px";
+      cssButton.style.height = "24px";
+      cssButton.style.border = "1px solid rgba(255, 255, 255, 0.1)";
+      cssButton.style.borderRadius = "7px";
+      cssButton.style.background = "#121a23";
+      cssButton.style.color = "#ffffff";
+      cssButton.style.fontSize = "12px";
+      cssButton.style.lineHeight = "12px";
+      cssButton.style.cursor = "pointer";
+      cssButton.style.zIndex = "2147483647";
+      cssButton.style.padding = "0";
+      cssButton.style.boxShadow = "0 6px 14px rgba(0,0,0,0.35)";
+      cssButton.style.display = "flex";
+      cssButton.style.alignItems = "center";
+      cssButton.style.justifyContent = "center";
 
-    const htmlButton = document.createElement("button");
-    htmlButton.type = "button";
-    htmlButton.title = "Załącz pełny HTML elementu do raportu";
-    htmlButton.dataset.uiFeedbackRegionId = regionId;
-    htmlButton.dataset.uiFeedbackControl = "1";
-    htmlButton.style.position = "fixed";
-    htmlButton.style.left = "0";
-    htmlButton.style.top = "0";
-    htmlButton.style.width = "24px";
-    htmlButton.style.height = "24px";
-    htmlButton.style.border = "1px solid rgba(255, 255, 255, 0.1)";
-    htmlButton.style.borderRadius = "7px";
-    htmlButton.style.background = "#121a23";
-    htmlButton.style.color = "#ffffff";
-    htmlButton.style.fontSize = "12px";
-    htmlButton.style.lineHeight = "12px";
-    htmlButton.style.cursor = "pointer";
-    htmlButton.style.zIndex = "2147483647";
-    htmlButton.style.padding = "0";
-    htmlButton.style.boxShadow = "0 6px 14px rgba(0,0,0,0.35)";
-    htmlButton.style.display = "flex";
-    htmlButton.style.alignItems = "center";
-    htmlButton.style.justifyContent = "center";
+      const cssIcon = document.createElement("span");
+      cssIcon.dataset.uiFeedbackControl = "1";
+      cssIcon.style.display = "inline-flex";
+      cssIcon.style.width = "14px";
+      cssIcon.style.height = "14px";
+      cssIcon.style.pointerEvents = "none";
+      cssIcon.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M9 3L4 12L9 21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M15 3L20 12L15 21" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/></svg>';
+      cssButton.appendChild(cssIcon);
 
-    const htmlIcon = document.createElement("span");
-    htmlIcon.dataset.uiFeedbackControl = "1";
-    htmlIcon.style.display = "inline-flex";
-    htmlIcon.style.width = "14px";
-    htmlIcon.style.height = "14px";
-    htmlIcon.style.pointerEvents = "none";
-    htmlIcon.innerHTML =
-      '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8 7L3 12L8 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 7L21 12L16 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 5L10 19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
-    htmlButton.appendChild(htmlIcon);
+      htmlButton = document.createElement("button");
+      htmlButton.type = "button";
+      htmlButton.title = "Załącz pełny HTML elementu do raportu";
+      htmlButton.dataset.uiFeedbackRegionId = regionId;
+      htmlButton.dataset.uiFeedbackControl = "1";
+      htmlButton.style.position = "fixed";
+      htmlButton.style.left = "0";
+      htmlButton.style.top = "0";
+      htmlButton.style.width = "24px";
+      htmlButton.style.height = "24px";
+      htmlButton.style.border = "1px solid rgba(255, 255, 255, 0.1)";
+      htmlButton.style.borderRadius = "7px";
+      htmlButton.style.background = "#121a23";
+      htmlButton.style.color = "#ffffff";
+      htmlButton.style.fontSize = "12px";
+      htmlButton.style.lineHeight = "12px";
+      htmlButton.style.cursor = "pointer";
+      htmlButton.style.zIndex = "2147483647";
+      htmlButton.style.padding = "0";
+      htmlButton.style.boxShadow = "0 6px 14px rgba(0,0,0,0.35)";
+      htmlButton.style.display = "flex";
+      htmlButton.style.alignItems = "center";
+      htmlButton.style.justifyContent = "center";
+
+      const htmlIcon = document.createElement("span");
+      htmlIcon.dataset.uiFeedbackControl = "1";
+      htmlIcon.style.display = "inline-flex";
+      htmlIcon.style.width = "14px";
+      htmlIcon.style.height = "14px";
+      htmlIcon.style.pointerEvents = "none";
+      htmlIcon.innerHTML =
+        '<svg viewBox="0 0 24 24" width="14" height="14" fill="none" xmlns="http://www.w3.org/2000/svg"><path d="M8 7L3 12L8 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 7L21 12L16 17" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/><path d="M14 5L10 19" stroke="currentColor" stroke-width="2" stroke-linecap="round"/></svg>';
+      htmlButton.appendChild(htmlIcon);
+    }
 
     let removeTriggered = false;
     const onRemoveRegion = (event) => {
@@ -2518,209 +2522,217 @@
       },
       true
     );
-    cssButton.addEventListener(
-      "click",
-      (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const visual = getRegionVisual(regionId);
-        if (visual?.cssAttached) {
+    if (cssButton) {
+      cssButton.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const visual = getRegionVisual(regionId);
+          if (visual?.cssAttached) {
+            safeSendMessage(
+              {
+                type: "DETACH_REGION_CSS",
+                regionId
+              },
+              (response) => {
+                if (chrome.runtime.lastError || !response?.ok) {
+                  if (floatingStatus) {
+                    floatingStatus.textContent =
+                      response?.error || chrome.runtime.lastError?.message || "Błąd odłączania CSS.";
+                    floatingStatus.style.color = "#b42318";
+                  }
+                  return;
+                }
+                if (!regionItem.element || typeof regionItem.element !== "object") {
+                  regionItem.element = {};
+                }
+                regionItem.element.cssSnapshot = "";
+                regionItem.element.cssSources = [];
+                if (visual) {
+                  visual.cssAttached = false;
+                  applyRegionCssButtonStyle(visual);
+                }
+                if (floatingStatus) {
+                  floatingStatus.textContent = "CSS elementu odłączony.";
+                  floatingStatus.style.color = "#0f766e";
+                }
+                sendEvent("ui.region.css.attach", { regionId, enabled: false });
+              }
+            );
+            return;
+          }
+
+          const elementMeta = visual?.elementMeta || regionItem.element || null;
+          const element = findElementFromMeta(elementMeta);
+          if (!element) {
+            if (floatingStatus) {
+              floatingStatus.textContent = "Nie znaleziono elementu do pobrania CSS.";
+              floatingStatus.style.color = "#b42318";
+            }
+            return;
+          }
+
+          const cssSnapshot = buildComputedCssSnapshot(element);
+          const cssSources = collectCssSources(element);
+          if (!cssSnapshot) {
+            if (floatingStatus) {
+              floatingStatus.textContent = "Nie udało się pobrać CSS elementu.";
+              floatingStatus.style.color = "#b42318";
+            }
+            return;
+          }
+
           safeSendMessage(
             {
-              type: "DETACH_REGION_CSS",
-              regionId
+              type: "ATTACH_REGION_CSS",
+              regionId,
+              cssSnapshot,
+              cssSources
             },
             (response) => {
               if (chrome.runtime.lastError || !response?.ok) {
                 if (floatingStatus) {
                   floatingStatus.textContent =
-                    response?.error || chrome.runtime.lastError?.message || "Błąd odłączania CSS.";
+                    response?.error || chrome.runtime.lastError?.message || "Błąd zapisu CSS.";
                   floatingStatus.style.color = "#b42318";
                 }
                 return;
               }
+
               if (!regionItem.element || typeof regionItem.element !== "object") {
                 regionItem.element = {};
               }
-              regionItem.element.cssSnapshot = "";
-              regionItem.element.cssSources = [];
+              regionItem.element.cssSnapshot = cssSnapshot;
+              regionItem.element.cssSources = cssSources;
+
               if (visual) {
-                visual.cssAttached = false;
+                visual.cssAttached = true;
                 applyRegionCssButtonStyle(visual);
               }
+
               if (floatingStatus) {
-                floatingStatus.textContent = "CSS elementu odłączony.";
+                floatingStatus.textContent = "CSS elementu załączony do raportu.";
                 floatingStatus.style.color = "#0f766e";
               }
-              sendEvent("ui.region.css.attach", { regionId, enabled: false });
+              sendEvent("ui.region.css.attach", {
+                regionId,
+                enabled: true,
+                cssChars: cssSnapshot.length,
+                cssSources: cssSources.length
+              });
             }
           );
-          return;
-        }
-
-        const elementMeta = visual?.elementMeta || regionItem.element || null;
-        const element = findElementFromMeta(elementMeta);
-        if (!element) {
-          if (floatingStatus) {
-            floatingStatus.textContent = "Nie znaleziono elementu do pobrania CSS.";
-            floatingStatus.style.color = "#b42318";
-          }
-          return;
-        }
-
-        const cssSnapshot = buildComputedCssSnapshot(element);
-        const cssSources = collectCssSources(element);
-        if (!cssSnapshot) {
-          if (floatingStatus) {
-            floatingStatus.textContent = "Nie udało się pobrać CSS elementu.";
-            floatingStatus.style.color = "#b42318";
-          }
-          return;
-        }
-
-        safeSendMessage(
-          {
-            type: "ATTACH_REGION_CSS",
-            regionId,
-            cssSnapshot,
-            cssSources
-          },
-          (response) => {
-            if (chrome.runtime.lastError || !response?.ok) {
-              if (floatingStatus) {
-                floatingStatus.textContent =
-                  response?.error || chrome.runtime.lastError?.message || "Błąd zapisu CSS.";
-                floatingStatus.style.color = "#b42318";
+        },
+        true
+      );
+    }
+    if (htmlButton) {
+      htmlButton.addEventListener(
+        "click",
+        (event) => {
+          event.preventDefault();
+          event.stopPropagation();
+          const visual = getRegionVisual(regionId);
+          if (visual?.htmlAttached) {
+            safeSendMessage(
+              {
+                type: "DETACH_REGION_HTML",
+                regionId
+              },
+              (response) => {
+                if (chrome.runtime.lastError || !response?.ok) {
+                  if (floatingStatus) {
+                    floatingStatus.textContent =
+                      response?.error || chrome.runtime.lastError?.message || "Błąd odłączania HTML.";
+                    floatingStatus.style.color = "#b42318";
+                  }
+                  return;
+                }
+                if (!regionItem.element || typeof regionItem.element !== "object") {
+                  regionItem.element = {};
+                }
+                regionItem.element.outerHtmlSnippet = "";
+                if (visual) {
+                  visual.htmlAttached = false;
+                  applyRegionHtmlButtonStyle(visual);
+                }
+                if (floatingStatus) {
+                  floatingStatus.textContent = "HTML elementu odłączony.";
+                  floatingStatus.style.color = "#0f766e";
+                }
+                sendEvent("ui.region.html.attach", { regionId, enabled: false });
               }
-              return;
-            }
-
-            if (!regionItem.element || typeof regionItem.element !== "object") {
-              regionItem.element = {};
-            }
-            regionItem.element.cssSnapshot = cssSnapshot;
-            regionItem.element.cssSources = cssSources;
-
-            if (visual) {
-              visual.cssAttached = true;
-              applyRegionCssButtonStyle(visual);
-            }
-
-            if (floatingStatus) {
-              floatingStatus.textContent = "CSS elementu załączony do raportu.";
-              floatingStatus.style.color = "#0f766e";
-            }
-            sendEvent("ui.region.css.attach", {
-              regionId,
-              enabled: true,
-              cssChars: cssSnapshot.length,
-              cssSources: cssSources.length
-            });
+            );
+            return;
           }
-        );
-      },
-      true
-    );
-    htmlButton.addEventListener(
-      "click",
-      (event) => {
-        event.preventDefault();
-        event.stopPropagation();
-        const visual = getRegionVisual(regionId);
-        if (visual?.htmlAttached) {
+
+          const elementMeta = visual?.elementMeta || regionItem.element || null;
+          const element = findElementFromMeta(elementMeta);
+          if (!element) {
+            if (floatingStatus) {
+              floatingStatus.textContent = "Nie znaleziono elementu do pobrania HTML.";
+              floatingStatus.style.color = "#b42318";
+            }
+            return;
+          }
+
+          const outerHtmlSnippet = clip(element.outerHTML || "", 200000);
+          if (!outerHtmlSnippet) {
+            if (floatingStatus) {
+              floatingStatus.textContent = "Nie udało się pobrać HTML elementu.";
+              floatingStatus.style.color = "#b42318";
+            }
+            return;
+          }
+
           safeSendMessage(
             {
-              type: "DETACH_REGION_HTML",
-              regionId
+              type: "ATTACH_REGION_HTML",
+              regionId,
+              outerHtmlSnippet
             },
             (response) => {
               if (chrome.runtime.lastError || !response?.ok) {
                 if (floatingStatus) {
                   floatingStatus.textContent =
-                    response?.error || chrome.runtime.lastError?.message || "Błąd odłączania HTML.";
+                    response?.error || chrome.runtime.lastError?.message || "Błąd zapisu HTML.";
                   floatingStatus.style.color = "#b42318";
                 }
                 return;
               }
+
               if (!regionItem.element || typeof regionItem.element !== "object") {
                 regionItem.element = {};
               }
-              regionItem.element.outerHtmlSnippet = "";
+              regionItem.element.outerHtmlSnippet = outerHtmlSnippet;
+
               if (visual) {
-                visual.htmlAttached = false;
+                visual.htmlAttached = true;
                 applyRegionHtmlButtonStyle(visual);
               }
+
               if (floatingStatus) {
-                floatingStatus.textContent = "HTML elementu odłączony.";
+                floatingStatus.textContent = "HTML elementu załączony do raportu.";
                 floatingStatus.style.color = "#0f766e";
               }
-              sendEvent("ui.region.html.attach", { regionId, enabled: false });
+              sendEvent("ui.region.html.attach", { regionId, enabled: true, htmlChars: outerHtmlSnippet.length });
             }
           );
-          return;
-        }
-
-        const elementMeta = visual?.elementMeta || regionItem.element || null;
-        const element = findElementFromMeta(elementMeta);
-        if (!element) {
-          if (floatingStatus) {
-            floatingStatus.textContent = "Nie znaleziono elementu do pobrania HTML.";
-            floatingStatus.style.color = "#b42318";
-          }
-          return;
-        }
-
-        const outerHtmlSnippet = clip(element.outerHTML || "", 200000);
-        if (!outerHtmlSnippet) {
-          if (floatingStatus) {
-            floatingStatus.textContent = "Nie udało się pobrać HTML elementu.";
-            floatingStatus.style.color = "#b42318";
-          }
-          return;
-        }
-
-        safeSendMessage(
-          {
-            type: "ATTACH_REGION_HTML",
-            regionId,
-            outerHtmlSnippet
-          },
-          (response) => {
-            if (chrome.runtime.lastError || !response?.ok) {
-              if (floatingStatus) {
-                floatingStatus.textContent =
-                  response?.error || chrome.runtime.lastError?.message || "Błąd zapisu HTML.";
-                floatingStatus.style.color = "#b42318";
-              }
-              return;
-            }
-
-            if (!regionItem.element || typeof regionItem.element !== "object") {
-              regionItem.element = {};
-            }
-            regionItem.element.outerHtmlSnippet = outerHtmlSnippet;
-
-            if (visual) {
-              visual.htmlAttached = true;
-              applyRegionHtmlButtonStyle(visual);
-            }
-
-            if (floatingStatus) {
-              floatingStatus.textContent = "HTML elementu załączony do raportu.";
-              floatingStatus.style.color = "#0f766e";
-            }
-            sendEvent("ui.region.html.attach", { regionId, enabled: true, htmlChars: outerHtmlSnippet.length });
-          }
-        );
-      },
-      true
-    );
+        },
+        true
+      );
+    }
 
     document.documentElement.appendChild(marker);
     document.documentElement.appendChild(removeButton);
     document.documentElement.appendChild(noteButton);
-    document.documentElement.appendChild(cssButton);
-    document.documentElement.appendChild(htmlButton);
+    if (cssButton) {
+      document.documentElement.appendChild(cssButton);
+    }
+    if (htmlButton) {
+      document.documentElement.appendChild(htmlButton);
+    }
     regionVisuals.set(regionId, {
       marker,
       removeButton,
@@ -2774,6 +2786,9 @@
   }
 
   function onMouseDown(event) {
+    if (!domainEnabled) {
+      return;
+    }
     if (!sessionActive || !regionMode || event.button !== 0) {
       return;
     }
@@ -2791,6 +2806,9 @@
   }
 
   function onMouseMove(event) {
+    if (!domainEnabled) {
+      return;
+    }
     if (!sessionActive) {
       return;
     }
@@ -2828,6 +2846,9 @@
   }
 
   function onMouseUp(event) {
+    if (!domainEnabled) {
+      return;
+    }
     if (!sessionActive || !regionMode || !drawing || !drawStart) {
       return;
     }
@@ -2890,6 +2911,9 @@
   }
 
   function onClickCapture(event) {
+    if (!domainEnabled) {
+      return;
+    }
     if (!sessionActive) {
       return;
     }
@@ -3178,12 +3202,29 @@
   }
 
   chrome.runtime.onMessage.addListener((message, _sender, sendResponse) => {
+    if (message.type === "SET_DOMAIN_ENABLED") {
+      applyDomainEnabledState(message.enabled !== false);
+      sendResponse({
+        ok: true,
+        enabled: domainEnabled,
+        domain: getCurrentDomainKey()
+      });
+      return true;
+    }
+
+    if (message.type === "GET_DOMAIN_ENABLED") {
+      sendResponse({
+        ok: true,
+        enabled: domainEnabled,
+        domain: getCurrentDomainKey()
+      });
+      return true;
+    }
+
     if (message.type === "SET_SESSION_ACTIVE") {
       sessionActive = !!message.enabled;
       if (!sessionActive) {
         showUiOverlaysAfterScreenshot();
-        errorRecordingEnabled = false;
-        updateErrorRecordingButton();
         stopRegionMode();
         stopElementMode();
         clearAllRegionVisuals();
@@ -3199,6 +3240,10 @@
     }
 
     if (message.type === "START_REGION_MODE") {
+      if (!domainEnabled) {
+        sendResponse({ ok: false, error: "Rozszerzenie jest wyłączone dla tej domeny." });
+        return true;
+      }
       if (!sessionActive) {
         sendResponse({ ok: false, error: "Sesja nie jest aktywna." });
         return true;
@@ -3220,6 +3265,10 @@
     }
 
     if (message.type === "START_ELEMENT_MODE") {
+      if (!domainEnabled) {
+        sendResponse({ ok: false, error: "Rozszerzenie jest wyłączone dla tej domeny." });
+        return true;
+      }
       if (!sessionActive) {
         sendResponse({ ok: false, error: "Sesja nie jest aktywna." });
         return true;
@@ -3238,7 +3287,13 @@
     }
 
     if (message.type === "PING") {
-      sendResponse({ ok: true, sessionActive, regionMode, elementMode, errorRecordingEnabled });
+      sendResponse({
+        ok: true,
+        sessionActive,
+        regionMode,
+        elementMode,
+        domainEnabled
+      });
       return true;
     }
 
@@ -3272,5 +3327,9 @@
   window.addEventListener("error", onWindowError, true);
   window.addEventListener("unhandledrejection", onUnhandledRejection, true);
   window.addEventListener("ui-feedback-page-event", onPageBridgeEvent);
-  ensureFloatingControls();
+  chrome.storage.onChanged.addListener(onStorageChanged);
+  initializeDomainEnabledState().catch(() => {
+    domainEnabled = true;
+    showFloatingUi();
+  });
 })();
