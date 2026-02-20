@@ -374,11 +374,49 @@ function inferIssueType(notes) {
   return "ux";
 }
 
-function formatTrackerEventData(type, data) {
+function buildEventElementHint(element) {
+  if (!element || typeof element !== "object") {
+    return "";
+  }
+  const selector =
+    String(element.stableSelector || "").trim() ||
+    String(element.cssSelector || "").trim() ||
+    String(element.xpath || "").trim() ||
+    String(element.tagName || "").toLowerCase();
+  const text = clip(String(element.textCompact || element.text || "").replace(/\s+/g, " ").trim(), 120);
+  const role = String(element.role || "").trim();
+  const parts = [];
+  if (selector) {
+    parts.push(`selector=${clip(selector, 220)}`);
+  }
+  if (text) {
+    parts.push(`text="${text}"`);
+  }
+  if (role) {
+    parts.push(`role=${clip(role, 60)}`);
+  }
+  return parts.join(" ");
+}
+
+function compactStackLine(stackText) {
+  const raw = String(stackText || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const line = raw.split("\n").find((item) => /@|at\s+/.test(item)) || raw.split("\n")[0] || raw;
+  return clip(line.replace(/\s+/g, " ").trim(), 220);
+}
+
+function formatTrackerEventData(type, data, element = null) {
   const payload = data && typeof data === "object" ? data : {};
 
   if (type === "console.error") {
-    return String(payload.message || "console.error");
+    const message = String(payload.message || "console.error");
+    const errorName = String(payload.error?.name || "");
+    const errorCode = String(payload.error?.code || "");
+    const errorStatus = payload.error?.response?.status != null ? String(payload.error.response.status) : "";
+    const stack = compactStackLine(payload.error?.stack || payload.callerStack || "");
+    return [message, errorName, errorCode, errorStatus, stack].filter(Boolean).join(" | ");
   }
   if (type === "js.error") {
     return String(payload.message || "js.error");
@@ -390,15 +428,24 @@ function formatTrackerEventData(type, data) {
     const method = String(payload.method || "GET");
     const url = String(payload.url || "");
     const status = payload.status != null ? String(payload.status) : "";
-    return [method, url, status].filter(Boolean).join(" ");
+    const statusText = String(payload.statusText || "");
+    const errorMessage = String(payload.message || "");
+    const caller = compactStackLine(payload.callerStack || payload.error?.stack || "");
+    return [method, url, status, statusText, errorMessage, caller].filter(Boolean).join(" | ");
   }
   if (type === "ui.click") {
-    return `click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`;
+    const hint = buildEventElementHint(element);
+    return [`click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`, hint]
+      .filter(Boolean)
+      .join(" - ");
   }
   if (type === "ui.input") {
     const inputType = String(payload.inputType || "");
     const value = clip(String(payload.value || ""), 80);
-    return `${inputType}${value ? ` value=${value}` : ""}`.trim();
+    const hint = buildEventElementHint(element);
+    return [`${inputType}${value ? ` value=${value}` : ""}`.trim(), hint]
+      .filter(Boolean)
+      .join(" - ");
   }
   if (type === "ui.scroll") {
     return `scroll x=${Number(payload.scrollX || 0)} y=${Number(payload.scrollY || 0)}`;
@@ -603,14 +650,164 @@ function escapeCodeFence(input) {
   return String(input || "").replace(/```/g, "``\\`");
 }
 
+function collectAutoTimelineEvents(timeline, maxItems = 20) {
+  const TRACKED_TYPES = new Set([
+    "ui.click",
+    "ui.input",
+    "nav.change",
+    "console.error",
+    "network.failure",
+    "js.error",
+    "js.unhandledrejection"
+  ]);
+
+  if (!Array.isArray(timeline) || timeline.length === 0) {
+    return [];
+  }
+
+  const filtered = timeline.filter((event) => TRACKED_TYPES.has(String(event?.type || "")));
+  const tail = filtered.length > maxItems ? filtered.slice(filtered.length - maxItems) : filtered;
+  return tail.map((event) => ({
+    ts: String(event?.ts || ""),
+    type: String(event?.type || "unknown"),
+    urlPath: toUrlPath(String(event?.url || "")),
+    details: formatTrackerEventData(String(event?.type || ""), event?.data || {}, event?.element || null)
+  }));
+}
+
+function extractClickContextFromDetails(details) {
+  const raw = String(details || "");
+  if (!raw) {
+    return { selector: "", text: "", role: "" };
+  }
+
+  const selectorMatch = raw.match(/selector=(.+?)(?:\stext="|$)/);
+  const textMatch = raw.match(/text="([^"]*)"/);
+  const roleMatch = raw.match(/role=([^\s]+)/);
+
+  return {
+    selector: clip((selectorMatch?.[1] || "").trim(), 220),
+    text: clip((textMatch?.[1] || "").trim(), 140),
+    role: clip((roleMatch?.[1] || "").trim(), 60)
+  };
+}
+
+function summarizeAutoErrorEvent(event, clickContext) {
+  if (!event || typeof event !== "object") {
+    return "Automatically detected an error during user interaction.";
+  }
+
+  if (event.type === "network.failure") {
+    const parts = String(event.details || "")
+      .split("|")
+      .map((item) => item.trim())
+      .filter(Boolean);
+    const method = parts[0] || "REQUEST";
+    const url = parts[1] || "";
+    const status = parts[2] || "";
+    const statusText = parts[3] || "";
+    const statusLabel = [status, statusText].filter(Boolean).join(" ");
+    const base = `Request failed with ${statusLabel || "network.failure"}: ${method} ${url}`.trim();
+    if (clickContext?.text) {
+      return `${base}. Error appeared after clicking "${clickContext.text}".`;
+    }
+    return base;
+  }
+
+  if (event.type === "console.error") {
+    const base = `Application logged a console error: ${clip(String(event.details || ""), 220)}.`;
+    if (clickContext?.text) {
+      return `${base} Error appeared after clicking "${clickContext.text}".`;
+    }
+    return base;
+  }
+
+  return `Automatically detected ${event.type}: ${clip(String(event.details || ""), 220)}.`;
+}
+
+function buildIssuesFromAutoEvents(autoEvents, appUrl = "") {
+  if (!Array.isArray(autoEvents) || autoEvents.length === 0) {
+    return [];
+  }
+
+  const ERROR_TYPES = new Set(["network.failure", "console.error", "js.error", "js.unhandledrejection"]);
+  const lastErrorIndex = (() => {
+    for (let index = autoEvents.length - 1; index >= 0; index -= 1) {
+      if (ERROR_TYPES.has(String(autoEvents[index]?.type || ""))) {
+        return index;
+      }
+    }
+    return -1;
+  })();
+
+  if (lastErrorIndex < 0) {
+    return [];
+  }
+
+  const errorEvent = autoEvents[lastErrorIndex];
+  const previousClick = (() => {
+    for (let index = lastErrorIndex - 1; index >= 0; index -= 1) {
+      const item = autoEvents[index];
+      if (String(item?.type || "") === "ui.click") {
+        return item;
+      }
+    }
+    return null;
+  })();
+
+  const clickContext = extractClickContextFromDetails(previousClick?.details || "");
+  const reproSteps = [];
+  if (previousClick) {
+    reproSteps.push({
+      ts: previousClick.ts || "",
+      type: previousClick.type || "ui.click",
+      url: previousClick.urlPath || "",
+      details: previousClick.details || ""
+    });
+  }
+  reproSteps.push({
+    ts: errorEvent.ts || "",
+    type: errorEvent.type || "unknown",
+    url: errorEvent.urlPath || "",
+    details: errorEvent.details || ""
+  });
+
+  return [
+    {
+      id: `auto_issue_${parseTimestampMs(errorEvent.ts) || Date.now()}`,
+      ts: errorEvent.ts || "",
+      userNote: summarizeAutoErrorEvent(errorEvent, clickContext),
+      urlPath: errorEvent.urlPath || toUrlPath(appUrl) || "n/a",
+      selectionType: "auto",
+      selectorStable: clickContext.selector || "n/a",
+      cssSelector: clickContext.selector || "none",
+      xpath: "none",
+      tag: "none",
+      role: clickContext.role || "none",
+      elementText: clickContext.text || "none",
+      nearestLabelOrHeading: "none",
+      htmlSnippetCompact: "none",
+      htmlFull: "",
+      screenshotId: null,
+      reproSteps
+    }
+  ];
+}
+
 function buildMarkdown(reportId, payload, screenshotFileMap = {}) {
-  const issues = buildIssuesFromAnnotations(payload);
+  const annotationIssues = buildIssuesFromAnnotations(payload);
+  const autoEventsForIssues = collectAutoTimelineEvents(payload.timeline, 200);
+  const issues =
+    annotationIssues.length > 0
+      ? annotationIssues
+      : buildIssuesFromAutoEvents(autoEventsForIssues, payload.session?.pageContext?.url || "");
+  const autoEvents = collectAutoTimelineEvents(payload.timeline, 25);
   const appUrl = payload.session?.pageContext?.url || "";
   const globalScreenshotId = String(payload.globalScreenshotId || "");
   const globalScreenshotPath = globalScreenshotId ? screenshotFileMap[globalScreenshotId] || "" : "";
 
   const lines = [];
-  lines.push("# Raport UI Feedback");
+  lines.push("# UI Feedback Report");
   lines.push("");
   lines.push("## Meta");
   lines.push(`- report_id: ${reportId}`);
@@ -619,76 +816,94 @@ function buildMarkdown(reportId, payload, screenshotFileMap = {}) {
   lines.push(`- generated_at: ${nowIso()}`);
   lines.push(`- issues_count: ${issues.length}`);
   lines.push("");
-  lines.push("## Dowody Globalne");
+  lines.push("## Global Evidence");
   lines.push(`- viewport_screenshot: ${globalScreenshotPath || "none"}`);
   lines.push("");
-  lines.push("## Problemy");
+  lines.push("## Issues");
   lines.push("");
 
   if (issues.length === 0) {
-    lines.push("Brak adnotacji do zapisania.");
+    lines.push("No issues to report.");
     lines.push("");
-    return lines.join("\n");
   }
 
-  issues.forEach((item, idx) => {
-    const issueId = `ISSUE-${String(idx + 1).padStart(3, "0")}`;
-    lines.push(`### ${issueId}`);
-    lines.push(`- created_at: ${item.ts || "n/a"}`);
-    lines.push(`- user_note: "${item.userNote}"`);
+  if (issues.length > 0) {
+    issues.forEach((item, idx) => {
+      const issueId = `ISSUE-${String(idx + 1).padStart(3, "0")}`;
+      lines.push(`### ${issueId}`);
+      lines.push(`- created_at: ${item.ts || "n/a"}`);
+      lines.push(`- user_note: "${item.userNote}"`);
 
-    lines.push("");
-    lines.push("#### Zakres");
-    lines.push(`- url_path: ${item.urlPath || toUrlPath(appUrl) || "n/a"}`);
-    lines.push(`- selection_type: ${item.selectionType || "area"}`);
-    lines.push(`- selector_stable: ${item.selectorStable || "n/a"}`);
-    if (item.cssSelector && item.cssSelector !== "none") {
-      lines.push(`- selector_css: ${item.cssSelector}`);
-    }
-    if (item.xpath && item.xpath !== "none") {
-      lines.push(`- selector_xpath: ${item.xpath}`);
-    }
-    lines.push(`- tag: ${item.tag || "none"}`);
-    lines.push(`- role: ${item.role || "none"}`);
-
-    lines.push("");
-    lines.push("#### Kontekst");
-    lines.push(`- element_text: "${item.elementText}"`);
-    lines.push(`- nearest_label_or_heading: "${item.nearestLabelOrHeading}"`);
-    lines.push(`- html_snippet_compact: "${item.htmlSnippetCompact}"`);
-    if (item.htmlFull) {
       lines.push("");
-      lines.push("#### HTML (pełny, załączony)");
-      lines.push("```html");
-      lines.push(escapeCodeFence(item.htmlFull));
-      lines.push("```");
-    }
+      lines.push("#### Scope");
+      lines.push(`- url_path: ${item.urlPath || toUrlPath(appUrl) || "n/a"}`);
+      lines.push(`- selection_type: ${item.selectionType || "area"}`);
+      lines.push(`- selector_stable: ${item.selectorStable || "n/a"}`);
+      if (item.cssSelector && item.cssSelector !== "none") {
+        lines.push(`- selector_css: ${item.cssSelector}`);
+      }
+      if (item.xpath && item.xpath !== "none") {
+        lines.push(`- selector_xpath: ${item.xpath}`);
+      }
+      lines.push(`- tag: ${item.tag || "none"}`);
+      lines.push(`- role: ${item.role || "none"}`);
 
-    lines.push("");
-    lines.push("#### Dowody");
-    if (item.screenshotId && screenshotFileMap[item.screenshotId]) {
-      lines.push(`- screenshot: ${screenshotFileMap[item.screenshotId]} (${item.screenshotId})`);
-    } else {
-      lines.push("- screenshot: none");
-    }
+      lines.push("");
+      lines.push("#### Context");
+      lines.push(`- element_text: "${item.elementText}"`);
+      lines.push(`- nearest_label_or_heading: "${item.nearestLabelOrHeading}"`);
+      lines.push(`- html_snippet_compact: "${item.htmlSnippetCompact}"`);
+      if (item.htmlFull) {
+        lines.push("");
+        lines.push("#### HTML (full, attached)");
+        lines.push("```html");
+        lines.push(escapeCodeFence(item.htmlFull));
+        lines.push("```");
+      }
 
-    lines.push("");
-    lines.push("#### Kroki Reprodukcji");
-    if (!Array.isArray(item.reproSteps) || item.reproSteps.length === 0) {
-      lines.push("1. none");
-    } else {
-      item.reproSteps.slice(0, 5).forEach((step, stepIndex) => {
-        const parts = [
-          `${step.type || "unknown"}`,
-          step.url ? `@ ${toUrlPath(step.url)}` : "",
-          step.details ? `- ${step.details}` : "",
-          step.ts ? `(${step.ts})` : ""
-        ].filter(Boolean);
-        lines.push(`${stepIndex + 1}. ${parts.join(" ")}`);
-      });
-    }
-    lines.push("");
-  });
+      lines.push("");
+      lines.push("#### Evidence");
+      if (item.screenshotId && screenshotFileMap[item.screenshotId]) {
+        lines.push(`- screenshot: ${screenshotFileMap[item.screenshotId]} (${item.screenshotId})`);
+      } else {
+        lines.push("- screenshot: none");
+      }
+
+      lines.push("");
+      lines.push("#### Reproduction Steps");
+      if (!Array.isArray(item.reproSteps) || item.reproSteps.length === 0) {
+        lines.push("1. none");
+      } else {
+        item.reproSteps.slice(0, 5).forEach((step, stepIndex) => {
+          const parts = [
+            `${step.type || "unknown"}`,
+            step.url ? `@ ${toUrlPath(step.url)}` : "",
+            step.details ? `- ${step.details}` : "",
+            step.ts ? `(${step.ts})` : ""
+          ].filter(Boolean);
+          lines.push(`${stepIndex + 1}. ${parts.join(" ")}`);
+        });
+      }
+      lines.push("");
+    });
+  }
+
+  lines.push("## Automatic Events");
+  lines.push("");
+  if (autoEvents.length === 0) {
+    lines.push("1. none");
+  } else {
+    autoEvents.forEach((event, index) => {
+      const parts = [
+        `${event.type || "unknown"}`,
+        event.urlPath ? `@ ${event.urlPath}` : "",
+        event.details ? `- ${event.details}` : "",
+        event.ts ? `(${event.ts})` : ""
+      ].filter(Boolean);
+      lines.push(`${index + 1}. ${parts.join(" ")}`);
+    });
+  }
+  lines.push("");
 
   return lines.join("\n");
 }
@@ -697,8 +912,12 @@ function buildJsonReport(reportId, payload, screenshotFileMap = {}) {
   const appUrl = payload.session?.pageContext?.url || "";
   const globalScreenshotId = String(payload.globalScreenshotId || "");
   const globalScreenshotPath = globalScreenshotId ? screenshotFileMap[globalScreenshotId] || "" : "";
+  const autoEvents = collectAutoTimelineEvents(payload.timeline, 50);
+  const annotationIssues = buildIssuesFromAnnotations(payload);
+  const issuesSource =
+    annotationIssues.length > 0 ? annotationIssues : buildIssuesFromAutoEvents(autoEvents, appUrl);
 
-  const issues = buildIssuesFromAnnotations(payload).map((issue, index) => ({
+  const issues = issuesSource.map((issue, index) => ({
     issueId: `ISSUE-${String(index + 1).padStart(3, "0")}`,
     createdAt: issue.ts || "",
     userNote: issue.userNote || "",
@@ -733,6 +952,7 @@ function buildJsonReport(reportId, payload, screenshotFileMap = {}) {
       viewportScreenshot: globalScreenshotPath || "none",
       viewportScreenshotId: globalScreenshotId || null
     },
+    autoEvents,
     issues
   };
 }

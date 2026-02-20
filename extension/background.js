@@ -8,6 +8,7 @@ const LOCAL_API_URL = "http://127.0.0.1:3030/analyze";
 const DEBUG_LOGS = true;
 const REPRO_BEFORE_WINDOW_MS = 20_000;
 const REPRO_AFTER_ERROR_MS = 10_000;
+const REPRO_ERROR_LOOKBACK_MS = 60_000;
 const REPRO_MAX_USER_STEPS = 5;
 const ERROR_EVENT_TYPES = new Set([
   "js.error",
@@ -238,11 +239,55 @@ function getStableSelectorFromElement(element) {
   );
 }
 
-function formatTrackerEventData(type, data) {
+function buildEventElementHint(element) {
+  if (!element || typeof element !== "object") {
+    return "";
+  }
+
+  const selector =
+    clip(String(element.stableSelector || "").trim(), 220) ||
+    clip(String(element.cssSelector || "").trim(), 220) ||
+    clip(String(element.xpath || "").trim(), 220) ||
+    clip(String(element.tagName || "").toLowerCase(), 60);
+  const text = clip(
+    String(element.textCompact || element.text || "").replace(/\s+/g, " ").trim(),
+    120
+  );
+  const role = clip(String(element.role || "").trim(), 60);
+
+  const parts = [];
+  if (selector) {
+    parts.push(`selector=${selector}`);
+  }
+  if (text) {
+    parts.push(`text="${text}"`);
+  }
+  if (role) {
+    parts.push(`role=${role}`);
+  }
+
+  return parts.join(" ");
+}
+
+function compactStackLine(stackText) {
+  const raw = String(stackText || "").trim();
+  if (!raw) {
+    return "";
+  }
+  const line = raw.split("\n").find((item) => /@|at\s+/.test(item)) || raw.split("\n")[0] || raw;
+  return clip(line.replace(/\s+/g, " ").trim(), 220);
+}
+
+function formatTrackerEventData(type, data, element = null) {
   const payload = data && typeof data === "object" ? data : {};
 
   if (type === "console.error") {
-    return String(payload.message || "console.error");
+    const message = String(payload.message || "console.error");
+    const errorName = String(payload.error?.name || "");
+    const errorCode = String(payload.error?.code || "");
+    const errorStatus = payload.error?.response?.status != null ? String(payload.error.response.status) : "";
+    const stack = compactStackLine(payload.error?.stack || payload.callerStack || "");
+    return [message, errorName, errorCode, errorStatus, stack].filter(Boolean).join(" | ");
   }
   if (type === "js.error") {
     return String(payload.message || "js.error");
@@ -254,15 +299,24 @@ function formatTrackerEventData(type, data) {
     const method = String(payload.method || "GET");
     const url = String(payload.url || "");
     const status = payload.status != null ? String(payload.status) : "";
-    return [method, url, status].filter(Boolean).join(" ");
+    const statusText = String(payload.statusText || "");
+    const errorMessage = String(payload.message || "");
+    const caller = compactStackLine(payload.callerStack || payload.error?.stack || "");
+    return [method, url, status, statusText, errorMessage, caller].filter(Boolean).join(" | ");
   }
   if (type === "ui.click") {
-    return `click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`;
+    const hint = buildEventElementHint(element);
+    return [`click x=${Number(payload.clientX || 0)} y=${Number(payload.clientY || 0)}`, hint]
+      .filter(Boolean)
+      .join(" - ");
   }
   if (type === "ui.input") {
     const inputType = String(payload.inputType || "");
     const value = clip(String(payload.value || ""), 80);
-    return `${inputType}${value ? ` value=${value}` : ""}`.trim();
+    const hint = buildEventElementHint(element);
+    return [`${inputType}${value ? ` value=${value}` : ""}`.trim(), hint]
+      .filter(Boolean)
+      .join(" - ");
   }
   if (type === "ui.scroll") {
     return `scroll x=${Number(payload.scrollX || 0)} y=${Number(payload.scrollY || 0)}`;
@@ -273,7 +327,7 @@ function formatTrackerEventData(type, data) {
   return "";
 }
 
-function buildReproWindowFromTimeline(timeline, linkedEventId) {
+function buildReproWindowFromTimeline(timeline, linkedEventId, annotationTs = "") {
   if (!Array.isArray(timeline) || timeline.length === 0) {
     return [];
   }
@@ -287,10 +341,13 @@ function buildReproWindowFromTimeline(timeline, linkedEventId) {
   ]);
 
   const linkedEvent = timeline.find((event) => event.id === linkedEventId) || null;
-  const fallbackUserEvent = [...timeline].reverse().find((event) => USER_EVENT_TYPES.has(String(event?.type || ""))) || null;
+  const fallbackUserEvent =
+    [...timeline].reverse().find((event) => USER_EVENT_TYPES.has(String(event?.type || ""))) ||
+    null;
   const anchorEvent = linkedEvent || fallbackUserEvent;
-  const anchorTsMs = parseTimestampMs(anchorEvent?.ts);
-  if (!anchorEvent || !anchorTsMs) {
+  const annotationTsMs = parseTimestampMs(annotationTs);
+  const anchorTsMs = parseTimestampMs(anchorEvent?.ts) || annotationTsMs;
+  if (!anchorTsMs) {
     return [];
   }
 
@@ -311,10 +368,10 @@ function buildReproWindowFromTimeline(timeline, linkedEventId) {
       ts: event.ts || "",
       type: String(event.type || "unknown"),
       url: event.url || "",
-      details: formatTrackerEventData(String(event.type || ""), event.data || {})
+      details: formatTrackerEventData(String(event.type || ""), event.data || {}, event.element || null)
     }));
 
-  const nearestError = timeline
+  let nearestError = timeline
     .filter((event) => {
       const type = String(event?.type || "");
       if (!ERROR_EVENT_TYPES.has(type)) {
@@ -328,13 +385,55 @@ function buildReproWindowFromTimeline(timeline, linkedEventId) {
     })
     .sort((a, b) => parseTimestampMs(a.ts) - parseTimestampMs(b.ts))[0];
 
+  if (!nearestError) {
+    nearestError = timeline
+      .filter((event) => {
+        const type = String(event?.type || "");
+        if (!ERROR_EVENT_TYPES.has(type)) {
+          return false;
+        }
+        const tsMs = parseTimestampMs(event?.ts);
+        if (!tsMs) {
+          return false;
+        }
+        return tsMs <= anchorTsMs && tsMs >= anchorTsMs - REPRO_ERROR_LOOKBACK_MS;
+      })
+      .sort((a, b) => parseTimestampMs(b.ts) - parseTimestampMs(a.ts))[0];
+  }
+
+  if (!nearestError && linkedEventId) {
+    nearestError = timeline
+      .filter((event) => {
+        const type = String(event?.type || "");
+        if (!ERROR_EVENT_TYPES.has(type)) {
+          return false;
+        }
+        return String(event?.causedByEventId || "") === String(linkedEventId);
+      })
+      .sort((a, b) => Math.abs(parseTimestampMs(a.ts) - anchorTsMs) - Math.abs(parseTimestampMs(b.ts) - anchorTsMs))[0];
+  }
+
   if (nearestError) {
-    userSteps.push({
+    const errorStep = {
       ts: nearestError.ts || "",
       type: String(nearestError.type || "unknown"),
       url: nearestError.url || "",
-      details: formatTrackerEventData(String(nearestError.type || ""), nearestError.data || {})
-    });
+      details: formatTrackerEventData(
+        String(nearestError.type || ""),
+        nearestError.data || {},
+        nearestError.element || null
+      )
+    };
+    const duplicate = userSteps.some(
+      (step) =>
+        step.ts === errorStep.ts &&
+        step.type === errorStep.type &&
+        step.url === errorStep.url &&
+        step.details === errorStep.details
+    );
+    if (!duplicate) {
+      userSteps.push(errorStep);
+    }
   }
 
   return userSteps;
@@ -845,7 +944,11 @@ async function addAnnotation({ comment, tabId }) {
       linkedEventId: state.lastUiEvent?.id || null,
       screenshotId: null
     };
-    annotation.reproWindow = buildReproWindowFromTimeline(state.timeline, annotation.linkedEventId);
+    annotation.reproWindow = buildReproWindowFromTimeline(
+      state.timeline,
+      annotation.linkedEventId,
+      annotation.ts
+    );
     annotation.autoContext = buildAnnotationAutoContext(annotation, state.session.pageContext.url);
 
     state.annotations.push(annotation);
@@ -1162,7 +1265,11 @@ async function addAnnotationForRegion({
       linkedEventId: state.lastUiEvent?.id || null,
       screenshotId
     };
-    annotation.reproWindow = buildReproWindowFromTimeline(state.timeline, annotation.linkedEventId);
+    annotation.reproWindow = buildReproWindowFromTimeline(
+      state.timeline,
+      annotation.linkedEventId,
+      annotation.ts
+    );
     annotation.autoContext = buildAnnotationAutoContext(annotation, state.session.pageContext.url);
 
     state.annotations.push(annotation);

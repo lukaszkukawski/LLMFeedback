@@ -4,6 +4,55 @@
   }
   window.__UI_FEEDBACK_PAGE_HOOKS_INSTALLED__ = true;
 
+  const clip = (value, maxLen = 1200) => {
+    const text = String(value == null ? "" : value);
+    if (text.length <= maxLen) {
+      return text;
+    }
+    return `${text.slice(0, maxLen)}...[truncated]`;
+  };
+
+  const captureCallerStack = () => {
+    try {
+      const stack = new Error().stack || "";
+      const lines = stack.split("\n").slice(2, 8);
+      return clip(lines.join(" | "), 1200);
+    } catch {
+      return "";
+    }
+  };
+
+  const serializeErrorLike = (value) => {
+    if (!value || typeof value !== "object") {
+      return null;
+    }
+
+    const base = {
+      name: clip(value.name || ""),
+      message: clip(value.message || ""),
+      code: clip(value.code || ""),
+      stack: clip(value.stack || "", 2000)
+    };
+
+    if (value.config && typeof value.config === "object") {
+      base.config = {
+        method: clip(value.config.method || ""),
+        url: clip(value.config.url || ""),
+        baseURL: clip(value.config.baseURL || "")
+      };
+    }
+
+    if (value.response && typeof value.response === "object") {
+      base.response = {
+        status: value.response.status,
+        statusText: clip(value.response.statusText || ""),
+        url: clip(value.response.config?.url || "")
+      };
+    }
+
+    return base;
+  };
+
   const emit = (kind, payload) => {
     window.dispatchEvent(
       new CustomEvent("ui-feedback-page-event", {
@@ -20,22 +69,28 @@
       return "Unknown error";
     }
     if (typeof value === "string") {
-      return value;
+      return clip(value);
     }
     if (value instanceof Error) {
-      return `${value.name}: ${value.message}`;
+      return clip(`${value.name}: ${value.message}`);
     }
     try {
-      return JSON.stringify(value);
+      return clip(JSON.stringify(value));
     } catch {
-      return String(value);
+      return clip(String(value));
     }
   };
 
   const originalConsoleError = console.error;
   console.error = function patchedConsoleError(...args) {
     try {
-      emit("console.error", { message: args.map(toText).join(" ") });
+      const firstErrorArg = args.find((arg) => arg instanceof Error || (arg && typeof arg === "object")) || null;
+      emit("console.error", {
+        message: args.map(toText).join(" "),
+        args: args.slice(0, 6).map(toText),
+        error: serializeErrorLike(firstErrorArg),
+        callerStack: captureCallerStack()
+      });
     } catch {
       // ignore
     }
@@ -55,7 +110,8 @@
             method,
             url,
             status: response.status,
-            statusText: response.statusText
+            statusText: response.statusText,
+            callerStack: captureCallerStack()
           });
         }
         return response;
@@ -65,7 +121,9 @@
           method,
           url,
           status: "FETCH_THROW",
-          message: toText(error)
+          message: toText(error),
+          error: serializeErrorLike(error),
+          callerStack: captureCallerStack()
         });
         throw error;
       }
@@ -92,7 +150,9 @@
           method: (this.__uiFeedbackMeta && this.__uiFeedbackMeta.method) || "GET",
           url: (this.__uiFeedbackMeta && this.__uiFeedbackMeta.url) || "",
           status,
-          statusText: this.statusText || ""
+          statusText: this.statusText || "",
+          responseURL: this.responseURL || "",
+          callerStack: captureCallerStack()
         });
       }
     });
