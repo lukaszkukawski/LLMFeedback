@@ -54,6 +54,18 @@ Ustawienie jest zapamiętywane osobno per domena.
 
 Po udanym zapisie sesja jest automatycznie czyszczona.
 
+### Szybki flow (ze screenem)
+
+![Panel rozszerzenia](./screenExtensions.png)
+
+1. W panelu wybierz `Zaznacz obszar` albo `Wybierz element`.
+2. Zaznacz problematyczny fragment strony.
+3. Kliknij ikonę notatki `N` przy zaznaczeniu i dopisz, co jest nie tak.
+4. Powtórz kroki 1-3 tyle razy, ile chcesz dodać zgłoszeń.
+5. Kliknij `Zapisz plik`.
+6. Na dole panelu pojawi się link do raportu (`MD`) - kliknięcie kopiuje pełną ścieżkę.
+7. Wklej raport do LLM i poproś o poprawki zgłoszonych tematów.
+
 ### Akcje na zaznaczeniu
 
 - `×` - usuwa zaznaczenie i powiązane notatki z bieżącej sesji.
