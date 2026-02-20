@@ -1294,6 +1294,26 @@ function buildPayload(state, options = {}) {
   return payload;
 }
 
+function resetSessionStateAfterExport(state) {
+  const tabSnapshot = {
+    id: state.tabId,
+    windowId: state.windowId,
+    url: state.session?.pageContext?.url || "",
+    title: state.session?.pageContext?.title || ""
+  };
+
+  state.nextSeq = 1;
+  state.timeline = [];
+  state.regions = [];
+  state.annotations = [];
+  state.attachments = [];
+  state.selectedRegion = null;
+  state.lastUiEvent = null;
+  state.pendingInputEvents = [];
+  state.session = createEmptySession(tabSnapshot);
+  state.sessionActive = true;
+}
+
 async function queueExport(reason, payload) {
   return mutateState((state) => {
     const queued = {
@@ -1339,9 +1359,22 @@ async function exportToBackend(fileName = "") {
       };
     }
 
+    const resetResult = await mutateState((currentState) => {
+      if (!currentState.session) {
+        return { reset: false };
+      }
+      resetSessionStateAfterExport(currentState);
+      return {
+        reset: true,
+        sessionId: currentState.session?.id || null
+      };
+    });
+
     return {
       ok: true,
-      result: body
+      result: body,
+      sessionReset: !!resetResult?.reset,
+      sessionId: resetResult?.sessionId || null
     };
   } catch (error) {
     const queued = await queueExport("network-error", payload);

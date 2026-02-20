@@ -19,6 +19,7 @@
   let floatingFilePath = null;
   let floatingMarkAreaBtn = null;
   let floatingPickElementBtn = null;
+  let refreshCornerButtons = null;
   let panelScrollBlockEnabled = true;
   let panelVisible = false;
   let floatingCorner = "bottom-right";
@@ -34,11 +35,14 @@
   let prevHtmlUserSelect = "";
   let prevBodyUserSelect = "";
   let overlaysHiddenForScreenshot = false;
-  let domainEnabled = true;
+  let domainEnabled = false;
   const regionVisuals = new Map();
   const DEBUG_LOGS = false;
   const DOMAIN_SETTINGS_KEY = "uiFeedbackDomainSettings";
+  const WIDGET_PREFS_KEY = "uiFeedbackWidgetPrefs";
   const DOMAIN_PROTOCOLS = new Set(["http:", "https:"]);
+  const WIDGET_CORNERS = new Set(["top-left", "top-right", "bottom-left", "bottom-right"]);
+  const DEFAULT_WIDGET_CORNER = "bottom-right";
 
   function debugLog(...args) {
     if (!DEBUG_LOGS) {
@@ -57,23 +61,74 @@
 
   async function readDomainEnabledFromStorage() {
     if (!isDomainToggleSupported()) {
-      return true;
+      return false;
     }
 
     const domain = getCurrentDomainKey();
     if (!domain) {
-      return true;
+      return false;
     }
 
     try {
       const result = await chrome.storage.local.get(DOMAIN_SETTINGS_KEY);
       const map = result?.[DOMAIN_SETTINGS_KEY];
       if (!map || typeof map !== "object") {
-        return true;
+        return false;
       }
-      return map[domain] !== false;
+      return map[domain] === true;
     } catch {
-      return true;
+      return false;
+    }
+  }
+
+  function getWidgetPrefsScopeKey() {
+    if (!isDomainToggleSupported()) {
+      return "__global__";
+    }
+    const domain = getCurrentDomainKey();
+    return domain || "__global__";
+  }
+
+  function normalizeCorner(value) {
+    return WIDGET_CORNERS.has(value) ? value : DEFAULT_WIDGET_CORNER;
+  }
+
+  function resolveCornerFromPrefsMap(map) {
+    if (!map || typeof map !== "object") {
+      return DEFAULT_WIDGET_CORNER;
+    }
+    const scopedValue = map[getWidgetPrefsScopeKey()];
+    if (typeof scopedValue === "string" && WIDGET_CORNERS.has(scopedValue)) {
+      return scopedValue;
+    }
+    const globalValue = map.__global__;
+    if (typeof globalValue === "string" && WIDGET_CORNERS.has(globalValue)) {
+      return globalValue;
+    }
+    return DEFAULT_WIDGET_CORNER;
+  }
+
+  async function readFloatingCornerFromStorage() {
+    try {
+      const result = await chrome.storage.local.get(WIDGET_PREFS_KEY);
+      return resolveCornerFromPrefsMap(result?.[WIDGET_PREFS_KEY]);
+    } catch {
+      return DEFAULT_WIDGET_CORNER;
+    }
+  }
+
+  async function writeFloatingCornerToStorage(corner) {
+    const nextCorner = normalizeCorner(corner);
+    try {
+      const result = await chrome.storage.local.get(WIDGET_PREFS_KEY);
+      const map =
+        result?.[WIDGET_PREFS_KEY] && typeof result[WIDGET_PREFS_KEY] === "object"
+          ? { ...result[WIDGET_PREFS_KEY] }
+          : {};
+      map[getWidgetPrefsScopeKey()] = nextCorner;
+      await chrome.storage.local.set({ [WIDGET_PREFS_KEY]: map });
+    } catch {
+      // Ignore storage failures; corner still applies for current session.
     }
   }
 
@@ -233,35 +288,50 @@
     hideFloatingUi();
   }
 
-  async function initializeDomainEnabledState() {
-    const enabled = await readDomainEnabledFromStorage();
+  async function initializeUiStateFromStorage() {
+    const [enabled, corner] = await Promise.all([
+      readDomainEnabledFromStorage(),
+      readFloatingCornerFromStorage()
+    ]);
+    floatingCorner = normalizeCorner(corner);
     applyDomainEnabledState(enabled);
   }
 
   function resolveDomainEnabledFromSettingsMap(map) {
     if (!isDomainToggleSupported()) {
-      return true;
+      return false;
     }
     const domain = getCurrentDomainKey();
     if (!domain) {
-      return true;
+      return false;
     }
     if (!map || typeof map !== "object") {
-      return true;
+      return false;
     }
-    return map[domain] !== false;
+    return map[domain] === true;
   }
 
   function onStorageChanged(changes, areaName) {
     if (areaName !== "local") {
       return;
     }
-    if (!Object.prototype.hasOwnProperty.call(changes, DOMAIN_SETTINGS_KEY)) {
-      return;
+    if (Object.prototype.hasOwnProperty.call(changes, DOMAIN_SETTINGS_KEY)) {
+      const nextMap = changes[DOMAIN_SETTINGS_KEY]?.newValue;
+      const enabled = resolveDomainEnabledFromSettingsMap(nextMap);
+      applyDomainEnabledState(enabled);
     }
-    const nextMap = changes[DOMAIN_SETTINGS_KEY]?.newValue;
-    const enabled = resolveDomainEnabledFromSettingsMap(nextMap);
-    applyDomainEnabledState(enabled);
+
+    if (Object.prototype.hasOwnProperty.call(changes, WIDGET_PREFS_KEY)) {
+      const nextMap = changes[WIDGET_PREFS_KEY]?.newValue;
+      const nextCorner = resolveCornerFromPrefsMap(nextMap);
+      if (nextCorner !== floatingCorner) {
+        floatingCorner = nextCorner;
+        applyFloatingCorner();
+        if (typeof refreshCornerButtons === "function") {
+          refreshCornerButtons();
+        }
+      }
+    }
   }
 
   function setScrollLockReason(reason, enabled) {
@@ -812,6 +882,7 @@
         button.style.boxShadow = isActive ? "0 0 4px rgba(19, 127, 236, 0.5)" : "none";
       }
     };
+    refreshCornerButtons = updateCornerButtons;
 
     for (const item of cornerItems) {
       const btn = document.createElement("button");
@@ -832,6 +903,7 @@
           floatingCorner = item.value;
           applyFloatingCorner();
           updateCornerButtons();
+          writeFloatingCornerToStorage(floatingCorner);
         },
         true
       );
@@ -1242,20 +1314,19 @@
 
           const requestedStem = sanitizeFileStem(fileName);
           if (!isRequestedStemUsed(requestedStem, mdPath)) {
-            resetSessionFromPanel({
-              successMessage:
-                "Zapisano raport, ale backend nie użył podanej nazwy. Rozpoczęto nową czystą sesję.",
-              onFailureMessage:
-                "Zapisano raport, ale backend nie użył podanej nazwy i nie udało się automatycznie wyczyścić sesji.",
-            });
+            sessionActive = true;
+            stopRegionMode();
+            stopElementMode();
+            clearAllRegionVisuals();
+            setFloatingStatus("Zapisano raport. Sesja została wyczyszczona.");
             return;
           }
 
-          resetSessionFromPanel({
-            successMessage: `Zapisano raport: ${result.reportId || "ok"}. Rozpoczęto nową czystą sesję.`,
-            onFailureMessage:
-              "Zapisano raport, ale nie udało się automatycznie wyczyścić sesji.",
-          });
+          sessionActive = true;
+          stopRegionMode();
+          stopElementMode();
+          clearAllRegionVisuals();
+          setFloatingStatus(`Zapisano raport: ${result.reportId || "ok"}. Sesja została wyczyszczona.`);
         }
       );
     };
@@ -3328,8 +3399,8 @@
   window.addEventListener("unhandledrejection", onUnhandledRejection, true);
   window.addEventListener("ui-feedback-page-event", onPageBridgeEvent);
   chrome.storage.onChanged.addListener(onStorageChanged);
-  initializeDomainEnabledState().catch(() => {
-    domainEnabled = true;
-    showFloatingUi();
+  initializeUiStateFromStorage().catch(() => {
+    domainEnabled = false;
+    hideFloatingUi();
   });
 })();

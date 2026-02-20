@@ -6,7 +6,7 @@ const statusEl = document.getElementById("status");
 
 let activeTab = null;
 let activeDomain = "";
-let domainEnabled = true;
+let domainEnabled = false;
 
 function setStatus(text, isError = false) {
   statusEl.textContent = text || "";
@@ -56,9 +56,9 @@ async function readDomainState(domain) {
   const result = await chrome.storage.local.get(DOMAIN_SETTINGS_KEY);
   const map = result?.[DOMAIN_SETTINGS_KEY];
   if (!map || typeof map !== "object") {
-    return true;
+    return false;
   }
-  return map[domain] !== false;
+  return map[domain] === true;
 }
 
 async function writeDomainState(domain, enabled) {
