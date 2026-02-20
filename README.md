@@ -56,7 +56,11 @@ Po udanym zapisie sesja jest automatycznie czyszczona.
 
 ### Szybki flow (ze screenem)
 
-![Panel rozszerzenia](./screenExtensions.png)
+![Panel rozszerzenia](./assets/screenExtensions.png)
+
+### Demo (GIF)
+
+![Demo użycia](./assets/demo.gif)
 
 1. W panelu wybierz `Zaznacz obszar` albo `Wybierz element`.
 2. Zaznacz problematyczny fragment strony.
